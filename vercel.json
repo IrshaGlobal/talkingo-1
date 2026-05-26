@@ -1,6 +1,0 @@
-{
-  "buildCommand": "npm run build --workspace=@talkingo/web",
-  "installCommand": "npm install",
-  "framework": "nextjs",
-  "outputDirectory": "apps/web/.next"
-}
