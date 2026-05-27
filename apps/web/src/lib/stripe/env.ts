@@ -1,10 +1,8 @@
 /**
  * Stripe environment validation.
  *
- * Reads + validates required Stripe env vars at first import. Throws a clear
- * error if anything is missing instead of silently falling back to test-mode
- * placeholders. Import this module from any Stripe API route to fail-fast on
- * misconfiguration.
+ * Lazily validates required Stripe env vars on first access (not at import time).
+ * This prevents build failures when env vars aren't available during static analysis.
  */
 
 const REQUIRED_VARS = [
@@ -17,7 +15,11 @@ const REQUIRED_VARS = [
 
 type RequiredVar = (typeof REQUIRED_VARS)[number]
 
+let _cached: Record<RequiredVar, string> | null = null
+
 function readEnv(): Record<RequiredVar, string> {
+  if (_cached) return _cached
+
   const missing: string[] = []
   const out = {} as Record<RequiredVar, string>
 
@@ -37,15 +39,22 @@ function readEnv(): Record<RequiredVar, string> {
     )
   }
 
+  _cached = out
   return out
 }
 
-export const STRIPE_ENV = readEnv()
+/** Lazy accessor — only validates when first accessed at runtime, not at build time. */
+export const STRIPE_ENV = new Proxy({} as Record<RequiredVar, string>, {
+  get(_target, prop: string) {
+    const env = readEnv()
+    return env[prop as RequiredVar]
+  },
+})
 
 export const STRIPE_PRICES = {
-  trial: STRIPE_ENV.STRIPE_PRICE_TRIAL,
-  monthly: STRIPE_ENV.STRIPE_PRICE_MONTHLY,
-  yearly: STRIPE_ENV.STRIPE_PRICE_YEARLY,
+  get trial() { return STRIPE_ENV.STRIPE_PRICE_TRIAL },
+  get monthly() { return STRIPE_ENV.STRIPE_PRICE_MONTHLY },
+  get yearly() { return STRIPE_ENV.STRIPE_PRICE_YEARLY },
 } as const
 
 export const STRIPE_API_VERSION = '2025-01-27.acacia' as const
