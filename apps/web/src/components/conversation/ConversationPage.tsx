@@ -63,11 +63,9 @@ import {
 import {
   loadProfile,
   saveProfile,
-  loadProfileLocal,
   createEmptyProfile,
   mergeDigestIntoProfile,
   buildDigestPrompt,
-  getNextRecommendation,
   needsMigration,
   migrateToProfile,
   buildConversationState,
@@ -83,11 +81,8 @@ import type {
   Correction,
   VocabItem,
   SessionRecap,
-  LanguageProgress,
   TargetLanguage,
-  SkillDomain,
 } from '@talkingo/shared/types'
-import { DEFAULT_DOMAIN_SCORES } from '@talkingo/shared/types'
 import { getPersonaById } from '@talkingo/shared/gemini/personas'
 import { getSeedById, pickNextSeed, getStartingSeedForLevel } from '@talkingo/shared/curriculum'
 import { useAuth } from '@/context/AuthContext'
