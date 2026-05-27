@@ -2,6 +2,7 @@
 
 import { createContext, useContext, useEffect, useState, useCallback } from 'react'
 import { getSession, signOut as authSignOut, type AuthUser } from '@/lib/auth/auth'
+import { installAuthFetchInterceptor } from '@/lib/api/auth-fetch'
 import { useRouter } from 'next/navigation'
 
 interface AuthContextValue {
@@ -22,6 +23,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null)
   const [loading, setLoading] = useState(true)
   const router = useRouter()
+
+  // Install the fetch interceptor once on mount — ensures all /api/ calls
+  // include the Appwrite session token automatically.
+  useEffect(() => {
+    installAuthFetchInterceptor()
+  }, [])
 
   const refresh = useCallback(async () => {
     const session = await getSession()

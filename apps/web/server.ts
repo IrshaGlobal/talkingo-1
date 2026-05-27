@@ -15,7 +15,8 @@ import { WebSocket, WebSocketServer } from 'ws'
 import { getSystemInstruction } from '@talkingo/shared/gemini'
 import { getPersonaById } from '@talkingo/shared/gemini/personas'
 import type { ConversationState } from '@talkingo/shared/types'
-import { Client, Databases, Query } from 'node-appwrite'
+import { Client, Databases, Account, Query } from 'node-appwrite'
+import { APPWRITE_DB_ID, COLLECTION_IDS } from './src/lib/appwrite-schema'
 
 // ─── Master prompt cache (refreshed every 5 min) ──────────────────────────────
 let _cachedMasterPrompt: string | null = null
@@ -28,12 +29,13 @@ async function getLiveMasterPrompt(): Promise<string | null> {
     return _cachedMasterPrompt
   }
   try {
+    // system_config has read("any") permission — no API key needed for this
+    // public read. Anyone with the project ID can fetch the master prompt.
     const client = new Client()
       .setEndpoint(process.env.NEXT_PUBLIC_APPWRITE_ENDPOINT!)
       .setProject(process.env.NEXT_PUBLIC_APPWRITE_PROJECT_ID!)
-      .setKey(process.env.APPWRITE_API_KEY!)
     const databases = new Databases(client)
-    const res = await databases.listDocuments('talkingo_db', 'system_config', [
+    const res = await databases.listDocuments(APPWRITE_DB_ID, COLLECTION_IDS.SYSTEM_CONFIG, [
       Query.equal('key', 'master_prompt'),
       Query.limit(1),
     ])
@@ -55,7 +57,7 @@ const port = parseInt(process.env.PORT ?? '3000', 10)
 const app = next({ dev, hostname, port })
 const handle = app.getRequestHandler()
 
-const LIVE_MODEL = 'gemini-3.1-flash-live-preview'
+const LIVE_MODEL = process.env.GEMINI_LIVE_MODEL || 'gemini-3.1-flash-live-preview'
 const GEMINI_LIVE_WS = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent'
 
 app.prepare().then(() => {
@@ -77,22 +79,40 @@ app.prepare().then(() => {
     }
 
     if (pathname === '/api/gemini/live') {
-      // ── Auth: verify Appwrite session from cookies ─────────────────────
-      const cookies = req.headers.cookie || ''
-      const sessionCookie = cookies
-        .split(';')
-        .map((c: string) => c.trim())
-        .find((c: string) => c.startsWith('a_session_'))
+      // ── Auth: verify Appwrite JWT ──────────────────────────────────────
+      // Mirrors the auth-guard used by /api/* routes. WebSocket clients send
+      // the JWT as a query param because browsers can't attach custom headers
+      // to a WebSocket upgrade request.
+      const parsedWsUrl = parse(req.url ?? '/', true)
+      const queryJwt = parsedWsUrl.query?.jwt as string | undefined
+      // Accept legacy `?session=` for any clients that haven't refreshed yet,
+      // but treat it as a JWT (clients have moved to JWT auth).
+      const queryFallback = parsedWsUrl.query?.session as string | undefined
+      const jwt = queryJwt || queryFallback
 
-      if (!sessionCookie) {
+      if (!jwt) {
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
         socket.destroy()
         return
       }
 
-      wss.handleUpgrade(req, socket as any, head, (clientWs) => {
-        handleLiveSession(clientWs)
-      })
+      // Verify the JWT against Appwrite before upgrading. This blocks anyone
+      // from binding the live model with a forged token.
+      verifyAppwriteJwt(jwt)
+        .then((userId) => {
+          if (!userId) {
+            socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
+            socket.destroy()
+            return
+          }
+          wss.handleUpgrade(req, socket as any, head, (clientWs) => {
+            handleLiveSession(clientWs, userId)
+          })
+        })
+        .catch(() => {
+          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
+          socket.destroy()
+        })
     } else {
       socket.destroy()
     }
@@ -105,7 +125,26 @@ app.prepare().then(() => {
 
 // ─── Live session handler ──────────────────────────────────────────────────────
 
-function handleLiveSession(clientWs: WebSocket) {
+/**
+ * Verify an Appwrite JWT. Returns the user id on success, null otherwise.
+ * Mirrors src/lib/api/auth-guard.ts for HTTP routes.
+ */
+async function verifyAppwriteJwt(jwt: string): Promise<string | null> {
+  try {
+    const client = new Client()
+      .setEndpoint(process.env.NEXT_PUBLIC_APPWRITE_ENDPOINT!)
+      .setProject(process.env.NEXT_PUBLIC_APPWRITE_PROJECT_ID!)
+      .setJWT(jwt)
+    const account = new Account(client)
+    const user = await account.get()
+    return user.$id ?? null
+  } catch (err) {
+    console.warn('[live-proxy] JWT verify failed:', (err as Error).message)
+    return null
+  }
+}
+
+function handleLiveSession(clientWs: WebSocket, userId: string) {
   const apiKey = process.env.GEMINI_API_KEY
   if (!apiKey) {
     clientWs.send(JSON.stringify({ type: 'error', message: 'GEMINI_API_KEY not configured' }))
@@ -113,8 +152,12 @@ function handleLiveSession(clientWs: WebSocket) {
     return
   }
 
+  console.log('[live-proxy] Session opened for user:', userId)
+
   let geminiWs: WebSocket | null = null
   let setupDone = false
+  /** True after we've sent `ready` to the client. */
+  let readySent = false
 
   const sendToClient = (msg: object) => {
     if (clientWs.readyState === WebSocket.OPEN) {
@@ -175,6 +218,7 @@ function handleLiveSession(clientWs: WebSocket) {
         let serverMsg: any
         try { serverMsg = JSON.parse(data.toString()) } catch { return }
         handleGeminiMessage(serverMsg, sendToClient, () => {
+          readySent = true
           sendToClient({ type: 'ready' })
         })
       })
@@ -184,9 +228,23 @@ function handleLiveSession(clientWs: WebSocket) {
         sendToClient({ type: 'error', message: `Gemini error: ${err.message}` })
       })
 
-      geminiWs.on('close', (code) => {
-        console.log('[live-proxy] Gemini WS closed:', code)
-        if (clientWs.readyState === WebSocket.OPEN) clientWs.close(1000)
+      geminiWs.on('close', (code, reasonBuf) => {
+        const reason = reasonBuf?.toString() || ''
+        console.log('[live-proxy] Gemini WS closed:', code, reason)
+        // Surface a meaningful error to the client BEFORE closing the socket.
+        // Without this the client just sees `closed` and silently shows "Call ended".
+        if (!readySent) {
+          // Most common cause: model name unsupported, API key invalid, quota exceeded,
+          // or invalid setup payload. Gemini closes the WS with code 1007/1008/1011.
+          const msg =
+            code === 1008 ? 'Live API rejected the request. Check your API key and model access.'
+            : code === 1011 ? 'Live API server error. Try again in a moment.'
+            : code === 1007 ? 'Live API rejected the request payload.'
+            : reason ? `Live API closed: ${reason}`
+            : `Live API closed (code ${code}). Make sure your API key has access to the live model.`
+          sendToClient({ type: 'error', message: msg })
+        }
+        if (clientWs.readyState === WebSocket.OPEN) clientWs.close(1000, reason || 'gemini closed')
       })
 
       return
@@ -208,9 +266,15 @@ function handleLiveSession(clientWs: WebSocket) {
     }
 
     // ── Text turn ──
+    // Use clientContent (not realtimeInput.text) so we can mark turnComplete=true
+    // and force the model to respond. realtimeInput.text just appends to the
+    // input buffer and waits for VAD to commit, which never happens for typed text.
     if (msg.type === 'text') {
       geminiWs.send(JSON.stringify({
-        realtimeInput: { text: msg.text },
+        clientContent: {
+          turns: [{ role: 'user', parts: [{ text: msg.text }] }],
+          turnComplete: true,
+        },
       }))
       return
     }
@@ -224,18 +288,17 @@ function handleLiveSession(clientWs: WebSocket) {
     }
 
     // ── Interrupt ──
+    // The cleanest way to interrupt the model is to send a clientContent
+    // message with turnComplete=true. Per the Live API docs, "A message here
+    // will interrupt any current model generation." Sending an empty parts
+    // array would be invalid, so we send a single empty-string part which
+    // the API tolerates and treats as a turn boundary.
     if (msg.type === 'interrupt') {
-      // Send an empty audio chunk with streamEnd to force Gemini to stop
-      // This is the most reliable way to trigger a hard stop on the server side
-      geminiWs.send(JSON.stringify({
-        realtimeInput: { audioStreamEnd: true },
-      }))
-      // Also send a text signal if available in the API version
       geminiWs.send(JSON.stringify({
         clientContent: {
           turns: [{ role: 'user', parts: [{ text: '' }] }],
-          turnComplete: true
-        }
+          turnComplete: true,
+        },
       }))
       return
     }
@@ -262,6 +325,20 @@ function handleGeminiMessage(
   if (msg?.setupComplete !== undefined) {
     onSetupComplete?.()
     return
+  }
+
+  // Error envelope from Gemini (e.g. invalid model, quota exceeded). The Live
+  // API doesn't always close on a bad setup — sometimes it emits an `error`
+  // body. Surface it so the client doesn't sit at "Connecting…" forever.
+  if (msg?.error) {
+    const m = msg.error.message || msg.error.status || 'Gemini error'
+    sendToClient({ type: 'error', message: m })
+    return
+  }
+
+  // GoAway = server is about to close. Surface so the client can show a graceful message.
+  if (msg?.goAway) {
+    return // benign — let the close handler emit the error if needed.
   }
 
   const sc = msg?.serverContent

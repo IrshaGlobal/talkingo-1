@@ -1,30 +1,29 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { Client, Databases, Query } from 'node-appwrite'
+import { Query } from 'node-appwrite'
+import { getUserDatabases } from '@/lib/appwrite-server'
+import { APPWRITE_DB_ID, COLLECTION_IDS } from '@/lib/appwrite-schema'
 
-const client = new Client()
-  .setEndpoint(process.env.NEXT_PUBLIC_APPWRITE_ENDPOINT ?? 'https://fra.cloud.appwrite.io/v1')
-  .setProject(process.env.NEXT_PUBLIC_APPWRITE_PROJECT_ID ?? 'talkingo-1')
-  .setKey(process.env.APPWRITE_API_KEY!)
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
 
-const databases = new Databases(client)
+const NOTIFICATIONS_COLLECTION = COLLECTION_IDS.NOTIFICATIONS
 
-const DB_ID = 'talkingo_db'
-const NOTIFICATIONS_COLLECTION = 'notifications'
-
-// GET /api/notifications?userId=xxx — fetch notifications for a user
+// GET /api/notifications — fetch notifications for the authenticated user
 export async function GET(req: NextRequest) {
   try {
     // ── Auth: verify user has a valid session ────────────────────────────
     const { verifyAuth } = await import('@/lib/api/auth-guard')
-    const authenticatedUserId = await verifyAuth(req)
-    if (!authenticatedUserId) {
+    const auth = await verifyAuth(req)
+    if (!auth) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+    const { userId, jwt } = auth
 
-    // Use authenticated userId, ignore query param (prevents fetching other users' notifications)
-    const userId = authenticatedUserId
+    // Read as the user — respects per-doc permissions on the notifications
+    // collection (read("users") + the user's own notifications).
+    const databases = getUserDatabases(jwt)
 
-    const res = await databases.listDocuments(DB_ID, NOTIFICATIONS_COLLECTION, [
+    const res = await databases.listDocuments(APPWRITE_DB_ID, NOTIFICATIONS_COLLECTION, [
       Query.or([
         Query.equal('userId', userId),
         Query.equal('targetAll', true),
@@ -49,10 +48,11 @@ export async function PATCH(req: NextRequest) {
   try {
     // ── Auth: verify user has a valid session ────────────────────────────
     const { verifyAuth } = await import('@/lib/api/auth-guard')
-    const userId = await verifyAuth(req)
-    if (!userId) {
+    const auth = await verifyAuth(req)
+    if (!auth) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+    const { userId } = auth
 
     const body = await req.json()
     const { notificationId } = body
@@ -61,13 +61,39 @@ export async function PATCH(req: NextRequest) {
       return NextResponse.json({ error: 'notificationId is required' }, { status: 400 })
     }
 
-    await databases.updateDocument(DB_ID, NOTIFICATIONS_COLLECTION, notificationId, {
+    // Use admin client for the write so this works regardless of how the
+    // admin app set per-doc permissions. We enforce ownership manually:
+    // the user can only mark notifications they own (userId match) or
+    // broadcast notifications (targetAll === true).
+    const { getAdminDatabases } = await import('@/lib/appwrite-server')
+    const adminDb = getAdminDatabases()
+
+    let doc: any
+    try {
+      doc = await adminDb.getDocument(APPWRITE_DB_ID, NOTIFICATIONS_COLLECTION, notificationId)
+    } catch (err: any) {
+      if (err?.code === 404) {
+        return NextResponse.json({ error: 'Notification not found' }, { status: 404 })
+      }
+      throw err
+    }
+
+    const owns = doc.userId === userId
+    const isBroadcast = doc.targetAll === true
+    if (!owns && !isBroadcast) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
+
+    await adminDb.updateDocument(APPWRITE_DB_ID, NOTIFICATIONS_COLLECTION, notificationId, {
       read: true,
     })
 
     return NextResponse.json({ success: true })
   } catch (error: any) {
     console.error('[Web API] mark notification read error:', error)
-    return NextResponse.json({ error: error.message ?? 'Failed to update notification' }, { status: 500 })
+    return NextResponse.json(
+      { error: error.message ?? 'Failed to update notification' },
+      { status: 500 }
+    )
   }
 }

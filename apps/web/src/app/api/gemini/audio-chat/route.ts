@@ -31,10 +31,11 @@ export async function POST(req: NextRequest) {
 
   // ── Auth: verify user has a valid session ────────────────────────────
   const { verifyAuth, checkRateLimit } = await import('@/lib/api/auth-guard')
-  const userId = await verifyAuth(req)
-  if (!userId) {
+  const auth = await verifyAuth(req)
+  if (!auth) {
     return NextResponse.json({ error: 'unauthorized' }, { status: 401 })
   }
+  const userId = auth.userId
 
   // ── Rate limit: 30 audio requests per minute per user ──────────────────
   const { allowed } = checkRateLimit(`audio:${userId}`, 30, 60_000)

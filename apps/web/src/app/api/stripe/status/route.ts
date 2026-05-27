@@ -1,60 +1,68 @@
 import { NextRequest, NextResponse } from 'next/server'
-import Stripe from 'stripe'
+import { stripe } from '@/lib/stripe/client'
+import { getSubscription } from '@/lib/appwrite-server'
+
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
 
 /**
- * Check subscription status for a customer.
+ * Check subscription status for the authenticated user.
  * Called on app load to sync subscription state.
+ *
+ * Security: only ever queries the subscription that belongs to the
+ * authenticated user (looked up from the Appwrite subscriptions collection).
+ * The client cannot pass an arbitrary customerId.
  */
-
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2025-04-30.basil' as any,
-})
 
 export async function POST(req: NextRequest) {
   try {
-    // ── Auth: verify user has a valid session ────────────────────────────
+    // ── Auth ────────────────────────────────────────────────────────────
     const { verifyAuth } = await import('@/lib/api/auth-guard')
-    const userId = await verifyAuth(req)
-    if (!userId) {
+    const auth = await verifyAuth(req)
+    if (!auth) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+    const { userId, jwt } = auth
 
-    const { customerId } = await req.json()
+    // Body is optional — kept for backwards compat, but customerId is ignored
+    // for security. We always look up the subscription owned by this user.
+    try { await req.json() } catch { /* empty body is fine */ }
 
-    if (!customerId) {
-      // Try to get status from Appwrite DB first (no Stripe API call needed)
-      const { getSubscription } = await import('@/lib/appwrite-server')
-      const sub = await getSubscription(userId)
-      if (sub) {
+    // Source of truth: Appwrite subscriptions collection (written by webhook).
+    // Read as the user (their JWT) so we never leak another user's row.
+    const sub = await getSubscription(userId, jwt)
+    if (!sub) {
+      return NextResponse.json({ status: 'none' })
+    }
+
+    // For active/trialing subs, double-check with Stripe to catch out-of-band
+    // cancellations that haven't reached our webhook yet (cheap reads, no PII).
+    if ((sub.status === 'active' || sub.status === 'trialing') && sub.stripeSubscriptionId) {
+      try {
+        const live = await stripe.subscriptions.retrieve(sub.stripeSubscriptionId)
         return NextResponse.json({
-          status: sub.status,
+          status: live.status,
           plan: sub.plan,
           customerId: sub.stripeCustomerId,
-          trialEndsAt: sub.trialEnd,
-          currentPeriodEnd: sub.periodEnd,
+          trialEndsAt: live.trial_end ? (live.trial_end as number) * 1000 : sub.trialEnd,
+          currentPeriodEnd: (live as any).current_period_end
+            ? (live as any).current_period_end * 1000
+            : sub.periodEnd,
+          cancelAtPeriodEnd: (live as any).cancel_at_period_end ?? sub.cancelAtPeriodEnd ?? false,
         })
+      } catch (stripeErr: any) {
+        // Stripe lookup failed — fall back to DB
+        console.warn('[stripe/status] Live lookup failed, using cached:', stripeErr?.message)
       }
-      return NextResponse.json({ status: 'none' })
     }
 
-    // If customerId provided, verify with Stripe (more authoritative)
-    const subscriptions = await stripe.subscriptions.list({
-      customer: customerId,
-      status: 'all',
-      limit: 1,
-    })
-
-    if (subscriptions.data.length === 0) {
-      return NextResponse.json({ status: 'none' })
-    }
-
-    const sub = subscriptions.data[0]
     return NextResponse.json({
       status: sub.status,
-      plan: sub.items.data[0]?.price?.recurring?.interval === 'year' ? 'yearly' : 'monthly',
-      customerId,
-      trialEndsAt: sub.trial_end ? (sub.trial_end as number) * 1000 : undefined,
-      currentPeriodEnd: (sub as any).current_period_end ? (sub as any).current_period_end * 1000 : undefined,
+      plan: sub.plan,
+      customerId: sub.stripeCustomerId,
+      trialEndsAt: sub.trialEnd,
+      currentPeriodEnd: sub.periodEnd,
+      cancelAtPeriodEnd: sub.cancelAtPeriodEnd ?? false,
     })
   } catch (err: any) {
     console.error('[stripe/status] Error:', err.message)

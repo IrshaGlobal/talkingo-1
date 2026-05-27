@@ -25,6 +25,13 @@ export function FreeUsageBadge({ remaining, onClick }: FreeUsageBadgeProps) {
       ? 'text-amber-500 bg-amber-500/10 border-amber-500/20'
       : 'text-red-500 bg-red-500/10 border-red-500/20'
 
+  // Friendlier label that explains what the count means
+  const label = remaining === 0
+    ? 'Daily limit reached'
+    : remaining === 1
+      ? '1 free message left today'
+      : `${remaining} free messages left today`
+
   return (
     <button
       onClick={onClick}
@@ -33,10 +40,11 @@ export function FreeUsageBadge({ remaining, onClick }: FreeUsageBadgeProps) {
         colorClass,
         onClick && 'hover:scale-105 cursor-pointer'
       )}
-      title={`${remaining} messages remaining today`}
+      title={label}
+      aria-label={label}
     >
       <MessageCircle className="w-3 h-3" />
-      <span>{remaining}/{total}</span>
+      <span>{remaining}/{total} today</span>
     </button>
   )
 }

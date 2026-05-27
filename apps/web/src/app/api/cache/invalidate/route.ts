@@ -12,11 +12,9 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server'
-import { Client, Databases, ID, Query } from 'node-appwrite'
-import { serverCache, CACHE_KEYS } from '@/lib/cache/server-cache'
 
-const DB_ID = 'talkingo_db'
-const COLLECTION_CONFIG = 'system_config'
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
 
 export async function POST(req: NextRequest) {
   // Simple auth check — shared secret header
@@ -28,11 +26,8 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  let body: { type?: string } = {}
-  try { body = await req.json() } catch { /* empty body is fine */ }
-
-  // No-op — scenarios are now hardcoded, no cache to invalidate
-  // Endpoint kept for backwards compatibility
+  // Drain body if present (no-op)
+  try { await req.json() } catch { /* empty body is fine */ }
 
   return NextResponse.json({
     success: true,

@@ -13,6 +13,7 @@
     "start": "npm run start --workspace=@talkingo/web"
   },
   "dependencies": {
-    "node-appwrite": "^24.1.0"
+    "node-appwrite": "^14.2.0"
   }
 }
+

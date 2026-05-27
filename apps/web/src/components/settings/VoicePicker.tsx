@@ -17,6 +17,7 @@ import { useState, useRef, useCallback } from 'react'
 import { cn } from '@talkingo/shared/utils'
 import { Phone, MessageCircle, Play, Square, Sparkles } from 'lucide-react'
 import { decodeBase64Pcm, getAudioContext } from '@/lib/utils/audio-decode'
+import { authFetch } from '@/lib/api/auth-fetch'
 
 // ─── Gemini Live Voices (30 total, language-agnostic) ─────────────────────────
 
@@ -245,7 +246,7 @@ export function VoicePicker({
     const sampleText = PREVIEW_PHRASES[targetLanguage] || PREVIEW_PHRASES['en']
 
     try {
-      const res = await fetch('/api/gemini/tts', {
+      const res = await authFetch('/api/gemini/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

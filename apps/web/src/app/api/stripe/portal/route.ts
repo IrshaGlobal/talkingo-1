@@ -1,45 +1,45 @@
 import { NextRequest, NextResponse } from 'next/server'
-import Stripe from 'stripe'
+import { stripe } from '@/lib/stripe/client'
+import { getSubscription } from '@/lib/appwrite-server'
+
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
 
 /**
  * Creates a Stripe Customer Portal session.
  * User can manage their subscription (cancel, upgrade, update payment method).
  *
- * Security: verifies the customerId belongs to the authenticated user
- * by checking the subscriptions collection in Appwrite.
+ * Security: the customerId is always derived from the authenticated user's
+ * subscription doc — never trusted from the request body. This means a user
+ * cannot open another user's billing portal, and stale localStorage values
+ * on the client don't break the flow.
  */
-
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2025-04-30.basil' as any,
-})
 
 export async function POST(req: NextRequest) {
   try {
-    const { customerId } = await req.json()
-
-    if (!customerId) {
-      return NextResponse.json({ error: 'customerId required' }, { status: 400 })
-    }
-
-    // ── Auth: verify user has a valid session ────────────────────────────
+    // ── Auth ────────────────────────────────────────────────────────────
     const { verifyAuth } = await import('@/lib/api/auth-guard')
-    const userId = await verifyAuth(req)
-    if (!userId) {
+    const auth = await verifyAuth(req)
+    if (!auth) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+    const { userId, jwt } = auth
 
-    // ── Ownership check: verify this customerId belongs to the user ─────
-    const { getSubscription } = await import('@/lib/appwrite-server')
-    const subscription = await getSubscription(userId)
-    if (!subscription || subscription.stripeCustomerId !== customerId) {
-      return NextResponse.json({ error: 'Forbidden — customer mismatch' }, { status: 403 })
+    // Look up the user's subscription server-side (source of truth).
+    // Read as the user (their JWT) so per-document permissions apply.
+    const subscription = await getSubscription(userId, jwt)
+    if (!subscription || !subscription.stripeCustomerId) {
+      return NextResponse.json(
+        { error: 'no_subscription', message: 'No subscription on file. Subscribe first.' },
+        { status: 404 }
+      )
     }
 
     const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'
 
     const session = await stripe.billingPortal.sessions.create({
-      customer: customerId,
-      return_url: appUrl,
+      customer: subscription.stripeCustomerId,
+      return_url: `${appUrl}?billing=updated`,
     })
 
     return NextResponse.json({ url: session.url })

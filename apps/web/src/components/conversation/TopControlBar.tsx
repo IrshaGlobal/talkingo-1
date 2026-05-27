@@ -9,9 +9,10 @@ import { AvatarSVG } from '../ui/AvatarSVG'
 import { AI_PERSONAS, isPersonaUnlocked, getPersonaById } from '@talkingo/shared/gemini/personas'
 import type { PersonaId, DomainScores } from '@talkingo/shared/types'
 import { LANGUAGES } from '@talkingo/shared/languages'
-import { getConversations, deleteConversation, formatDuration, formatDate, type SavedConversation } from '@/lib/utils/conversation-history'
+import { loadAllSessions, deleteSession as deleteSessionFromStorage, formatDuration as formatDur, formatSessionDate, type ChatSession } from '@/lib/storage/chat-sessions'
 import { loadSettings, saveSettings, type AppSettings } from '@/lib/storage/hybrid-storage'
 import { updateUserName } from '@/lib/auth/auth'
+import { authFetch } from '@/lib/api/auth-fetch'
 
 interface AppNotification {
   $id: string
@@ -122,8 +123,8 @@ export function TopControlBar({
 
   const [activePanel, setActivePanel] = useState<'settings' | 'notifications' | 'history' | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
-  const [conversations, setConversations] = useState<SavedConversation[]>([])
-  const [selectedConversation, setSelectedConversation] = useState<SavedConversation | null>(null)
+  const [conversations, setConversations] = useState<ChatSession[]>([])
+  const [selectedConversation, setSelectedConversation] = useState<ChatSession | null>(null)
   const [isEditingName, setIsEditingName] = useState(false)
   const [editName, setEditName] = useState('')
 
@@ -189,7 +190,7 @@ export function TopControlBar({
   // Refresh conversations when history panel opens
   useEffect(() => {
     if (activePanel === 'history') {
-      setConversations(getConversations(user?.id ?? null))
+      setConversations(loadAllSessions(user?.id ?? null))
     }
   }, [activePanel, user?.id])
 
@@ -245,7 +246,7 @@ export function TopControlBar({
 
   const markAsRead = async (notifId: string) => {
     try {
-      await fetch('/api/notifications', {
+      await authFetch('/api/notifications', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ notificationId: notifId }),
@@ -330,15 +331,15 @@ export function TopControlBar({
 
   const handleDeleteConversation = (id: string, e: React.MouseEvent) => {
     e.stopPropagation()
-    if (deleteConversation(id, user?.id ?? null)) {
-      setConversations(getConversations(user?.id ?? null))
+    if (deleteSessionFromStorage(user?.id ?? null, id)) {
+      setConversations(loadAllSessions(user?.id ?? null))
       if (selectedConversation?.id === id) {
         setSelectedConversation(null)
       }
     }
   }
 
-  const handleViewConversation = (conv: SavedConversation) => {
+  const handleViewConversation = (conv: ChatSession) => {
     setSelectedConversation(conv)
   }
 

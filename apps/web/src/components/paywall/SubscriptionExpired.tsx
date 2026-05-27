@@ -4,11 +4,16 @@
  * Subscription Expired / Re-subscribe UI.
  * Shown when a user's subscription has been canceled or expired.
  * Offers two paths: re-subscribe (new checkout) or manage billing (portal).
+ *
+ * The portal call no longer requires a customerId — the server looks it up
+ * from the authenticated user's subscription doc, so this UI works even if
+ * localStorage was cleared.
  */
 
 import { useState } from 'react'
 import { cn } from '@talkingo/shared/utils'
-import { AlertTriangle, CreditCard, RefreshCw, Crown, ArrowRight } from 'lucide-react'
+import { AlertTriangle, CreditCard, RefreshCw, Crown, ArrowRight, AlertCircle } from 'lucide-react'
+import { authFetch } from '@/lib/api/auth-fetch'
 
 interface SubscriptionExpiredProps {
   userEmail?: string
@@ -19,48 +24,52 @@ interface SubscriptionExpiredProps {
 }
 
 export function SubscriptionExpired({ userEmail, userId, customerId, reason }: SubscriptionExpiredProps) {
-  const [selectedPlan, setSelectedPlan] = useState<'monthly' | 'yearly'>('monthly')
+  const [selectedPlan, setSelectedPlan] = useState<'monthly' | 'yearly'>('yearly')
   const [loading, setLoading] = useState<'checkout' | 'portal' | null>(null)
+  const [errorMsg, setErrorMsg] = useState<string | null>(null)
 
   const handleResubscribe = async () => {
     setLoading('checkout')
+    setErrorMsg(null)
     try {
-      const res = await fetch('/api/stripe/checkout', {
+      const res = await authFetch('/api/stripe/checkout', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ plan: selectedPlan, email: userEmail, userId }),
       })
-      const { url, error } = await res.json()
-      if (url) {
-        window.location.href = url
-      } else {
-        console.error('[ReSubscribe] Checkout error:', error)
-        setLoading(null)
+      const data = await res.json()
+      if (res.ok && data.url) {
+        window.location.href = data.url
+        return
       }
+      setErrorMsg(data.message || 'Could not start checkout. Try again.')
+      setLoading(null)
     } catch (err) {
       console.error('[ReSubscribe] Error:', err)
+      setErrorMsg('Connection issue. Try again.')
       setLoading(null)
     }
   }
 
   const handleManageBilling = async () => {
-    if (!customerId) return
     setLoading('portal')
+    setErrorMsg(null)
     try {
-      const res = await fetch('/api/stripe/portal', {
+      const res = await authFetch('/api/stripe/portal', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ customerId }),
+        body: JSON.stringify({}),
       })
-      const { url, error } = await res.json()
-      if (url) {
-        window.location.href = url
-      } else {
-        console.error('[ReSubscribe] Portal error:', error)
-        setLoading(null)
+      const data = await res.json()
+      if (res.ok && data.url) {
+        window.location.href = data.url
+        return
       }
+      setErrorMsg(data.message || 'Could not open billing portal.')
+      setLoading(null)
     } catch (err) {
       console.error('[ReSubscribe] Error:', err)
+      setErrorMsg('Connection issue. Try again.')
       setLoading(null)
     }
   }
@@ -78,6 +87,11 @@ export function SubscriptionExpired({ userEmail, userId, customerId, reason }: S
       : 'Your subscription has expired. Pick up where you left off.'
 
   const Icon = reason === 'past_due' ? CreditCard : AlertTriangle
+
+  // We can attempt to manage billing regardless of localStorage customerId now —
+  // the server resolves it from the subscription doc. Past-due users always
+  // benefit from the portal even if cached customerId is missing.
+  const canManageBilling = reason === 'past_due' || !!customerId
 
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-background/95 backdrop-blur-xl p-4">
@@ -97,7 +111,7 @@ export function SubscriptionExpired({ userEmail, userId, customerId, reason }: S
         </div>
 
         {/* Past due: show "Update Payment" button prominently */}
-        {reason === 'past_due' && customerId && (
+        {reason === 'past_due' && (
           <button
             onClick={handleManageBilling}
             disabled={loading !== null}
@@ -165,8 +179,8 @@ export function SubscriptionExpired({ userEmail, userId, customerId, reason }: S
           </>
         )}
 
-        {/* Manage billing link (for expired/canceled users who have a customerId) */}
-        {reason !== 'past_due' && customerId && (
+        {/* Manage billing link (for expired/canceled users with a known customerId) */}
+        {reason !== 'past_due' && canManageBilling && (
           <button
             onClick={handleManageBilling}
             disabled={loading !== null}
@@ -176,6 +190,14 @@ export function SubscriptionExpired({ userEmail, userId, customerId, reason }: S
             Manage Billing
             <ArrowRight className="w-3.5 h-3.5" />
           </button>
+        )}
+
+        {/* Error message */}
+        {errorMsg && (
+          <div className="flex items-start gap-2 px-3 py-2 rounded-xl bg-red-500/10 border border-red-500/20">
+            <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
+            <p className="text-xs text-red-700 dark:text-red-400">{errorMsg}</p>
+          </div>
         )}
 
         {/* Fine print */}

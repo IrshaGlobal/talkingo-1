@@ -9,6 +9,7 @@ import {
 import type { Correction, VocabItem, MessageAudio, TeachingNote } from '@talkingo/shared/types'
 import { AvatarSVG } from '../ui/AvatarSVG'
 import { VoiceNotePlayer } from './VoiceNotePlayer'
+import { authFetch } from '@/lib/api/auth-fetch'
 
 interface TranscriptMessageProps {
   text: string
@@ -462,7 +463,7 @@ function ToolsAndPanels({
     setShowTranslation(true)
     setTranslating(true)
     try {
-      const res = await fetch('/api/gemini/translate', {
+      const res = await authFetch('/api/gemini/translate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text }),

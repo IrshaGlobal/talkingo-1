@@ -1,20 +1,20 @@
 'use client'
 
 /**
- * Phrase bank scrapbook — "Steal This Phrase".
+ * Vocabulary view — words the user is actively learning.
  *
- * Browse phrases the user has collected from each character, replay audio,
- * favorite them. Filters: All / Favorites / per-character.
+ * Shows active words from the LearnerProfile, organized by status:
+ * - Solid: words the user has mastered (graduated soon)
+ * - Shaky: words seen but not reliable yet
+ * - New: just introduced, not yet practiced
  */
 
 import { useEffect, useMemo, useState } from 'react'
 import { cn } from '@talkingo/shared/utils'
-import { X, Volume2, Heart, BookOpen, Quote, Filter } from 'lucide-react'
-import type { TrackedPhrase, TargetLanguage } from '@talkingo/shared/types'
-import { AI_PERSONAS, getPersonaById } from '@talkingo/shared/gemini/personas'
-import { AvatarSVG } from '../ui/AvatarSVG'
+import { X, Volume2, Sparkles, Filter, GraduationCap, Award } from 'lucide-react'
+import type { TargetLanguage } from '@talkingo/shared/types'
 import { geminiClient } from '@/lib/api/gemini-client'
-import { loadPhrases, toggleFavorite, recordReplay } from '@/lib/storage/phrase-bank'
+import { loadProfileLocal, type LearnerProfile, type ActiveWord } from '@/lib/learning'
 import { useAuth } from '@/context/AuthContext'
 
 interface PhraseBankDialogProps {
@@ -23,14 +23,13 @@ interface PhraseBankDialogProps {
   onClose: () => void
 }
 
-type Filter = 'all' | 'favorites' | string // string = personaId
+type Filter = 'all' | 'solid' | 'shaky' | 'new'
 
 export function PhraseBankDialog({ isOpen, targetLanguage, onClose }: PhraseBankDialogProps) {
   const { user } = useAuth()
   const [visible, setVisible] = useState(false)
-  const [phrases, setPhrases] = useState<TrackedPhrase[]>([])
+  const [profile, setProfile] = useState<LearnerProfile | null>(null)
   const [filter, setFilter] = useState<Filter>('all')
-  const [loading, setLoading] = useState(false)
 
   useEffect(() => {
     if (!isOpen) {
@@ -38,168 +37,131 @@ export function PhraseBankDialog({ isOpen, targetLanguage, onClose }: PhraseBank
       return
     }
     setTimeout(() => setVisible(true), 30)
-    setLoading(true)
-    loadPhrases(user?.id ?? null, !!user, targetLanguage)
-      .then((res) => setPhrases(res))
-      .catch(() => setPhrases([]))
-      .finally(() => setLoading(false))
+    const p = loadProfileLocal(user?.id ?? null, targetLanguage)
+    setProfile(p)
   }, [isOpen, targetLanguage, user])
 
+  const words = profile?.activeWords ?? []
+  const graduated = profile?.graduatedWords ?? []
+
   const filtered = useMemo(() => {
-    let list = [...phrases].reverse() // newest first
-    if (filter === 'favorites') list = list.filter((p) => p.isFavorite)
-    else if (filter !== 'all') list = list.filter((p) => p.characterId === filter)
-    return list
-  }, [phrases, filter])
+    if (filter === 'all') return [...words].reverse()
+    return words.filter(w => w.status === filter).reverse()
+  }, [words, filter])
 
-  const speak = (p: TrackedPhrase) => {
-    const persona = getPersonaById(p.characterId)
-    geminiClient.speak(p.fullSentence, {
-      voiceName: persona?.voiceName,
-      targetLanguage,
-    })
-    recordReplay(targetLanguage, p.id)
+  const counts = useMemo(() => ({
+    all: words.length,
+    solid: words.filter(w => w.status === 'solid').length,
+    shaky: words.filter(w => w.status === 'shaky').length,
+    new: words.filter(w => w.status === 'new').length,
+  }), [words])
+
+  const speak = (word: string) => {
+    geminiClient.speak(word, { targetLanguage })
   }
-
-  const fav = (p: TrackedPhrase) => {
-    const updated = toggleFavorite(targetLanguage, p.id)
-    setPhrases(updated)
-  }
-
-  // Counts by character for filter chips
-  const countsByPersona = useMemo(() => {
-    const m: Record<string, number> = {}
-    for (const p of phrases) m[p.characterId] = (m[p.characterId] ?? 0) + 1
-    return m
-  }, [phrases])
 
   if (!isOpen) return null
 
   return (
-    <div className="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/60 backdrop-blur-md">
+    <div
+      className={cn(
+        'fixed inset-0 z-50 flex items-end sm:items-center justify-center transition-opacity duration-200',
+        visible ? 'opacity-100' : 'opacity-0'
+      )}
+      onClick={onClose}
+    >
+      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+
       <div
         className={cn(
-          'relative w-full max-w-xl max-h-[90vh] flex flex-col bg-card/95 border border-border/50 rounded-3xl shadow-2xl transition-all duration-300',
-          visible ? 'opacity-100 scale-100' : 'opacity-0 scale-95'
+          'relative w-full max-w-md sm:max-w-lg bg-card/95 border border-border/50',
+          'sm:rounded-3xl rounded-t-3xl shadow-2xl overflow-hidden',
+          'transition-all duration-300',
+          visible ? 'translate-y-0' : 'translate-y-8'
         )}
+        onClick={(e) => e.stopPropagation()}
       >
-        <button
-          onClick={onClose}
-          className="absolute top-4 right-4 w-8 h-8 rounded-lg hover:bg-muted/50 flex items-center justify-center transition-colors z-10"
-          aria-label="Close"
-        >
-          <X className="w-5 h-5 text-foreground/70" />
-        </button>
-
         {/* Header */}
-        <div className="px-6 pt-6 pb-3 flex-shrink-0">
-          <div className="flex items-center gap-2 mb-1">
-            <BookOpen className="w-4 h-4 text-primary" />
-            <span className="text-[11px] font-bold uppercase tracking-wider text-primary">Phrase bank</span>
+        <div className="flex items-center justify-between px-5 py-4 border-b border-border/30">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-xl bg-primary/15 flex items-center justify-center">
+              <Sparkles className="w-4 h-4 text-primary" />
+            </div>
+            <div>
+              <h2 className="text-base font-bold text-foreground">Vocabulary</h2>
+              <p className="text-[11px] text-muted-foreground">
+                {counts.all} active · {graduated.length} mastered
+              </p>
+            </div>
           </div>
-          <h2 className="text-xl font-bold leading-snug">Phrases you've stolen.</h2>
-          <p className="text-xs text-muted-foreground mt-1">
-            Every word the AI introduces, with the full sentence and who said it.
-          </p>
-
-          {/* Filter chips */}
-          <div className="flex items-center gap-1.5 mt-4 flex-wrap">
-            <FilterChip active={filter === 'all'} onClick={() => setFilter('all')} label="All" count={phrases.length} />
-            <FilterChip
-              active={filter === 'favorites'}
-              onClick={() => setFilter('favorites')}
-              label={<><Heart className="w-3 h-3 inline mr-1 fill-current" />Favorites</>}
-              count={phrases.filter((p) => p.isFavorite).length}
-            />
-            {AI_PERSONAS.filter((p) => (countsByPersona[p.id] ?? 0) > 0).map((p) => (
-              <FilterChip
-                key={p.id}
-                active={filter === p.id}
-                onClick={() => setFilter(p.id)}
-                label={p.name}
-                count={countsByPersona[p.id] ?? 0}
-              />
-            ))}
-          </div>
+          <button
+            onClick={onClose}
+            className="w-8 h-8 rounded-xl hover:bg-muted/50 flex items-center justify-center transition-colors"
+            aria-label="Close"
+          >
+            <X className="w-4 h-4 text-foreground/70" />
+          </button>
         </div>
 
-        {/* List */}
-        <div className="flex-1 overflow-y-auto px-6 pb-6 custom-scrollbar">
-          {loading ? (
-            <div className="py-12 text-center text-xs text-muted-foreground">Loading…</div>
-          ) : filtered.length === 0 ? (
-            <div className="py-12 flex flex-col items-center text-center">
-              <Quote className="w-10 h-10 text-muted-foreground/30 mb-3" />
+        {/* Filter tabs */}
+        <div className="px-5 py-3 border-b border-border/20 flex items-center gap-1.5 overflow-x-auto scrollbar-hide">
+          {(['all', 'shaky', 'new', 'solid'] as Filter[]).map((f) => (
+            <button
+              key={f}
+              onClick={() => setFilter(f)}
+              className={cn(
+                'flex-shrink-0 px-3 py-1.5 rounded-full text-xs font-semibold transition-all whitespace-nowrap',
+                filter === f
+                  ? 'bg-primary text-white shadow-sm'
+                  : 'bg-muted/40 text-muted-foreground hover:bg-muted/60'
+              )}
+            >
+              {f === 'all' ? 'All' : f === 'shaky' ? 'Practicing' : f === 'new' ? 'New' : 'Solid'}
+              <span className="ml-1.5 opacity-70">{counts[f]}</span>
+            </button>
+          ))}
+        </div>
+
+        {/* Word list */}
+        <div className="max-h-[60vh] overflow-y-auto px-5 py-3 space-y-2 custom-scrollbar">
+          {filtered.length === 0 ? (
+            <div className="py-12 text-center">
+              <div className="w-14 h-14 rounded-2xl bg-muted/30 flex items-center justify-center mx-auto mb-3">
+                <Sparkles className="w-6 h-6 text-muted-foreground/40" />
+              </div>
               <p className="text-sm font-medium text-foreground mb-1">
-                {filter === 'all' ? 'No phrases yet' : 'Nothing here'}
+                {filter === 'all' ? 'No vocabulary yet' : `No ${filter} words`}
               </p>
-              <p className="text-xs text-muted-foreground max-w-xs">
-                {filter === 'all'
-                  ? 'Start a conversation — every new word the AI uses gets saved here automatically.'
-                  : 'Try a different filter to find your phrases.'}
+              <p className="text-xs text-muted-foreground max-w-[240px] mx-auto">
+                Have a few conversations and your vocabulary will start building here.
               </p>
             </div>
           ) : (
-            <div className="space-y-3">
-              {filtered.map((p) => {
-                const persona = getPersonaById(p.characterId)
-                return (
-                  <div
-                    key={p.id}
-                    className="p-3.5 rounded-xl bg-card/60 border border-border/30 hover:border-border/50 transition-colors"
+            filtered.map((word) => (
+              <WordCard key={word.word} word={word} onSpeak={() => speak(word.word)} />
+            ))
+          )}
+
+          {/* Graduated section */}
+          {graduated.length > 0 && filter === 'all' && (
+            <div className="pt-4 mt-4 border-t border-border/20">
+              <div className="flex items-center gap-2 mb-2 px-1">
+                <GraduationCap className="w-3.5 h-3.5 text-secondary" />
+                <p className="text-[11px] font-semibold text-secondary uppercase tracking-wider">
+                  Mastered ({graduated.length})
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {graduated.slice(-30).map((w) => (
+                  <button
+                    key={w}
+                    onClick={() => speak(w)}
+                    className="px-2.5 py-1 rounded-full bg-secondary/10 text-secondary text-xs font-medium hover:bg-secondary/20 transition-colors"
                   >
-                    {/* Character header */}
-                    <div className="flex items-center gap-2 mb-2">
-                      <div className="w-6 h-6 rounded-full overflow-hidden border border-border/40 flex-shrink-0">
-                        <AvatarSVG personaId={p.characterId} size={24} />
-                      </div>
-                      <span className="text-[11px] font-semibold text-foreground">{persona?.name ?? p.characterId}</span>
-                      <span className="text-[10px] text-muted-foreground">said</span>
-                      <span className="ml-auto text-[10px] text-muted-foreground">
-                        {new Date(p.addedAt).toLocaleDateString()}
-                      </span>
-                    </div>
-
-                    {/* Sentence with highlighted term */}
-                    <p className="text-sm leading-relaxed text-foreground mb-1">
-                      {renderHighlight(p.fullSentence, p.highlightTerm)}
-                    </p>
-
-                    {/* Term + gloss */}
-                    <div className="flex items-baseline gap-2 mb-2">
-                      <span className="text-xs font-bold text-primary">{p.highlightTerm}</span>
-                      <span className="text-xs text-muted-foreground">— {p.gloss}</span>
-                    </div>
-
-                    {/* Actions */}
-                    <div className="flex items-center gap-1.5">
-                      <button
-                        onClick={() => speak(p)}
-                        className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-card/60 border border-border/40 text-[11px] hover:border-border/60 transition-colors"
-                      >
-                        <Volume2 className="w-3 h-3" /> Hear it
-                      </button>
-                      <button
-                        onClick={() => fav(p)}
-                        className={cn(
-                          'inline-flex items-center gap-1 px-2 py-1 rounded-md border text-[11px] transition-colors',
-                          p.isFavorite
-                            ? 'bg-pink-500/10 border-pink-500/40 text-pink-400'
-                            : 'bg-card/60 border-border/40 hover:border-border/60'
-                        )}
-                      >
-                        <Heart className={cn('w-3 h-3', p.isFavorite && 'fill-current')} />
-                        {p.isFavorite ? 'Favorited' : 'Favorite'}
-                      </button>
-                      {p.replayCount > 0 && (
-                        <span className="text-[10px] text-muted-foreground/60 ml-1">
-                          played {p.replayCount}×
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                )
-              })}
+                    {w}
+                  </button>
+                ))}
+              </div>
             </div>
           )}
         </div>
@@ -208,45 +170,47 @@ export function PhraseBankDialog({ isOpen, targetLanguage, onClose }: PhraseBank
   )
 }
 
-function FilterChip({
-  active, label, onClick, count,
-}: {
-  active: boolean
-  label: React.ReactNode
-  onClick: () => void
-  count: number
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={cn(
-        'inline-flex items-center gap-1 px-2.5 py-1 rounded-full border text-[11px] font-medium transition-colors',
-        active
-          ? 'bg-primary text-white border-primary shadow-sm'
-          : 'bg-card/60 border-border/40 text-muted-foreground hover:text-foreground hover:border-border/60'
-      )}
-    >
-      <span>{label}</span>
-      {count > 0 && (
-        <span className={cn(
-          'text-[10px] tabular-nums',
-          active ? 'text-white/80' : 'text-muted-foreground'
-        )}>
-          {count}
-        </span>
-      )}
-    </button>
-  )
-}
+function WordCard({ word, onSpeak }: { word: ActiveWord; onSpeak: () => void }) {
+  const statusColor = word.status === 'solid'
+    ? 'bg-primary/10 border-primary/25 text-primary'
+    : word.status === 'shaky'
+    ? 'bg-amber-500/10 border-amber-500/25 text-amber-600 dark:text-amber-400'
+    : 'bg-muted/30 border-border/30 text-muted-foreground'
 
-function renderHighlight(sentence: string, term: string): React.ReactNode {
-  if (!term) return sentence
-  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const re = new RegExp(`(${escaped})`, 'i')
-  const parts = sentence.split(re)
-  return parts.map((part, i) =>
-    re.test(part)
-      ? <span key={i} className="font-semibold text-primary bg-primary/10 px-0.5 rounded">{part}</span>
-      : <span key={i}>{part}</span>
+  const statusLabel = word.status === 'solid' ? 'Solid' : word.status === 'shaky' ? 'Practicing' : 'New'
+
+  return (
+    <div className="p-3 rounded-xl bg-card/60 border border-border/30 hover:border-primary/30 transition-all group">
+      <div className="flex items-start justify-between gap-2 mb-1.5">
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 mb-0.5">
+            <h3 className="text-sm font-semibold text-foreground truncate">{word.word}</h3>
+            <span className={cn(
+              'px-1.5 py-0.5 rounded-full border text-[9px] font-bold uppercase flex-shrink-0',
+              statusColor
+            )}>
+              {statusLabel}
+            </span>
+          </div>
+          <p className="text-xs text-muted-foreground line-clamp-2">{word.meaning}</p>
+        </div>
+        <button
+          onClick={onSpeak}
+          className="flex-shrink-0 w-8 h-8 rounded-lg hover:bg-primary/10 flex items-center justify-center transition-colors opacity-0 group-hover:opacity-100"
+          aria-label="Play pronunciation"
+        >
+          <Volume2 className="w-3.5 h-3.5 text-primary" />
+        </button>
+      </div>
+      <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+        <span>Met {word.met}×</span>
+        {word.usedCorrectly > 0 && (
+          <>
+            <span>·</span>
+            <span className="text-primary/80">Used {word.usedCorrectly}×</span>
+          </>
+        )}
+      </div>
+    </div>
   )
 }

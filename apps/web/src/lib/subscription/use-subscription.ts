@@ -9,6 +9,8 @@
  * localStorage is just a cache for instant rendering.
  */
 
+import { authFetch } from '@/lib/api/auth-fetch'
+
 export type SubscriptionStatus = 'active' | 'trialing' | 'past_due' | 'canceled' | 'expired' | 'none'
 
 export interface SubscriptionInfo {
@@ -17,6 +19,8 @@ export interface SubscriptionInfo {
   customerId?: string
   trialEndsAt?: number
   currentPeriodEnd?: number
+  /** True when the user has cancelled but still has access until the period end */
+  cancelAtPeriodEnd?: boolean
   /** Timestamp of last server verification */
   verifiedAt?: number
 }
@@ -69,12 +73,10 @@ export async function verifySubscription(userId?: string | null): Promise<Subscr
   const info = getSubscriptionInfo(userId)
 
   try {
-    // The status route now checks Appwrite DB first (fast, no Stripe API call)
-    // Falls back to Stripe if customerId is provided
-    const res = await fetch('/api/stripe/status', {
+    const res = await authFetch('/api/stripe/status', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customerId: info.customerId || undefined }),
+      body: JSON.stringify({}),
     })
     if (!res.ok) return info
 
@@ -87,6 +89,7 @@ export async function verifySubscription(userId?: string | null): Promise<Subscr
       customerId: serverInfo.customerId || info.customerId,
       trialEndsAt: serverInfo.trialEndsAt,
       currentPeriodEnd: serverInfo.currentPeriodEnd,
+      cancelAtPeriodEnd: serverInfo.cancelAtPeriodEnd ?? false,
       verifiedAt: Date.now(),
     }
     saveSubscriptionInfo(updated, userId)
@@ -141,3 +144,69 @@ export function isPastDue(userId?: string | null): boolean {
   return info.status === 'past_due'
 }
 
+// ─── Trial / period helpers (UI conversion levers) ──────────────────────────
+
+/**
+ * Days remaining in the trial. Returns null if not in trial or no trialEndsAt.
+ * Floors to whole days; e.g. 1.4 days remaining → 1.
+ */
+export function getTrialDaysRemaining(userId?: string | null): number | null {
+  const info = getSubscriptionInfo(userId)
+  if (info.status !== 'trialing' || !info.trialEndsAt) return null
+  const ms = info.trialEndsAt - Date.now()
+  if (ms <= 0) return 0
+  return Math.floor(ms / (24 * 60 * 60 * 1000))
+}
+
+/**
+ * Hours remaining (used when < 1 day left, e.g. "Trial ends in 6 hours").
+ */
+export function getTrialHoursRemaining(userId?: string | null): number | null {
+  const info = getSubscriptionInfo(userId)
+  if (info.status !== 'trialing' || !info.trialEndsAt) return null
+  const ms = info.trialEndsAt - Date.now()
+  if (ms <= 0) return 0
+  return Math.floor(ms / (60 * 60 * 1000))
+}
+
+/**
+ * Pretty trial countdown for UI: "Trial ends in 4 days" / "...6 hours" / "...today".
+ * Returns null if not in trial.
+ */
+export function getTrialCountdownLabel(userId?: string | null): string | null {
+  const days = getTrialDaysRemaining(userId)
+  if (days === null) return null
+  if (days >= 1) return `Trial ends in ${days} day${days === 1 ? '' : 's'}`
+  const hours = getTrialHoursRemaining(userId)
+  if (hours === null) return null
+  if (hours >= 1) return `Trial ends in ${hours} hour${hours === 1 ? '' : 's'}`
+  return 'Trial ends today'
+}
+
+/**
+ * Cancellation banner label for users who cancelled but still have access.
+ * Returns null when there's nothing to show.
+ */
+export function getCancellationLabel(userId?: string | null): string | null {
+  const info = getSubscriptionInfo(userId)
+  if (!info.cancelAtPeriodEnd || !info.currentPeriodEnd) return null
+  const ms = info.currentPeriodEnd - Date.now()
+  if (ms <= 0) return null
+  const days = Math.ceil(ms / (24 * 60 * 60 * 1000))
+  if (days >= 1) return `Cancels in ${days} day${days === 1 ? '' : 's'}`
+  return 'Cancels today'
+}
+
+/**
+ * Format the next billing date as a human-readable string.
+ */
+export function getNextBillingLabel(userId?: string | null): string | null {
+  const info = getSubscriptionInfo(userId)
+  const ts = info.currentPeriodEnd
+  if (!ts) return null
+  try {
+    return new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
+  } catch {
+    return null
+  }
+}

@@ -21,6 +21,7 @@ import type {
   PersonaId,
 } from '@talkingo/shared/types'
 import { getBcp47, getLanguageMeta } from '@talkingo/shared/languages'
+import { authFetch } from '@/lib/api/auth-fetch'
 
 // ─── Chat API ─────────────────────────────────────────────────────────────────
 
@@ -66,7 +67,7 @@ class GeminiClientService {
   // ─── AI ───────────────────────────────────────────────────────────────────
 
   async generateOpener(state: ConversationState, userName?: string): Promise<GeminiOpenerResponse> {
-    const res = await fetch('/api/gemini/chat', {
+    const res = await authFetch('/api/gemini/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ type: 'opener', state, history: [], userName }),
@@ -91,7 +92,7 @@ class GeminiClientService {
       ? this.chatHistory.slice(-(MAX_HISTORY + 1), -1)
       : this.chatHistory.slice(0, -1)
 
-    const res = await fetch('/api/gemini/chat', {
+    const res = await authFetch('/api/gemini/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -131,7 +132,7 @@ class GeminiClientService {
       : this.chatHistory.slice(0, -1)
 
     try {
-      const res = await fetch('/api/gemini/stream', {
+      const res = await authFetch('/api/gemini/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -220,7 +221,7 @@ class GeminiClientService {
       ? this.chatHistory.slice(-MAX_HISTORY)
       : this.chatHistory
 
-    const res = await fetch('/api/gemini/audio-chat', {
+    const res = await authFetch('/api/gemini/audio-chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -251,7 +252,7 @@ class GeminiClientService {
     userText: string,
     targetLanguage: TargetLanguage
   ): Promise<GeminiAssessmentResponse> {
-    const res = await fetch('/api/gemini/chat', {
+    const res = await authFetch('/api/gemini/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ type: 'assessment', userText, targetLanguage }),
@@ -267,7 +268,7 @@ class GeminiClientService {
     targetLanguage: TargetLanguage,
     learningGoal?: string
   ): Promise<string> {
-    const res = await fetch('/api/gemini/chat', {
+    const res = await authFetch('/api/gemini/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -288,7 +289,7 @@ class GeminiClientService {
     transcript: OnboardingTurn[],
     targetLanguage: TargetLanguage
   ): Promise<GeminiAssessmentResponse> {
-    const res = await fetch('/api/gemini/chat', {
+    const res = await authFetch('/api/gemini/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -312,7 +313,7 @@ class GeminiClientService {
     durationSeconds: number
     plantedPhrase?: { term: string; gloss: string; targetUses: number } | null
   }): Promise<SessionRecap> {
-    const res = await fetch('/api/gemini/chat', {
+    const res = await authFetch('/api/gemini/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ type: 'recap', recap: args }),
@@ -327,7 +328,7 @@ class GeminiClientService {
     targetLanguage: TargetLanguage,
     conversationContext?: string
   ): Promise<RegisterAlternatives> {
-    const res = await fetch('/api/gemini/chat', {
+    const res = await authFetch('/api/gemini/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -339,17 +340,14 @@ class GeminiClientService {
     return res.json()
   }
 
-  /** Update character memory after a session. */
-  async updateCharacterMemory(args: {
-    personaId: PersonaId
-    previousSummary: string
-    knownFacts: string[]
-    transcript: Array<{ role: 'user' | 'ai'; text: string }>
-  }): Promise<{ summary: string; newFacts: string[]; lastTopics: string[] }> {
-    const res = await fetch('/api/gemini/chat', {
+  /** Generate a session digest for the new learning system. */
+  async generateSessionDigest(args: {
+    digestPrompt: string
+  }): Promise<any> {
+    const res = await authFetch('/api/gemini/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: 'memory-update', memoryRequest: args }),
+      body: JSON.stringify({ type: 'session-digest', digestPrompt: args.digestPrompt }),
     })
     if (!res.ok) await this._throwServiceError(res)
     return res.json()
@@ -573,7 +571,7 @@ class GeminiClientService {
   ): Promise<{ data: string; sampleRate: number; format?: string; voiceName?: string } | null> {
     const languageCode = options?.targetLanguage ? getBcp47(options.targetLanguage) : this.currentLang
     try {
-      const res = await fetch('/api/gemini/tts', {
+      const res = await authFetch('/api/gemini/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -603,7 +601,7 @@ class GeminiClientService {
     const languageCode = options?.targetLanguage ? getBcp47(options.targetLanguage) : this.currentLang
 
     try {
-      const res = await fetch('/api/gemini/tts', {
+      const res = await authFetch('/api/gemini/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -748,3 +746,5 @@ export const geminiClient = new GeminiClientService()
 
 // Re-export language helpers for convenience
 export { getBcp47, getLanguageMeta }
+
+

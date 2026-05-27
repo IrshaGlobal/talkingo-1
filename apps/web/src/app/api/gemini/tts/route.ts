@@ -20,10 +20,11 @@ const FALLBACK_VOICES = ['Aoede', 'Charon', 'Fenrir']
 export async function POST(req: NextRequest) {
   // ── Auth: verify user has a valid session ────────────────────────────
   const { verifyAuth, checkRateLimit } = await import('@/lib/api/auth-guard')
-  const userId = await verifyAuth(req)
-  if (!userId) {
+  const auth = await verifyAuth(req)
+  if (!auth) {
     return NextResponse.json({ error: 'unauthorized' }, { status: 401 })
   }
+  const userId = auth.userId
 
   const { allowed } = checkRateLimit(`tts:${userId}`, 60, 60_000)
   if (!allowed) {

@@ -16,10 +16,10 @@
     "plugins": [{ "name": "next" }],
     "paths": {
       "@/*": ["./src/*"],
-      "@talkingo/shared": ["../../packages/shared/src/index.ts"],
-      "@talkingo/shared/*": ["../../packages/shared/src/*"]
+      "@talkingo/shared": ["./src/shared/index.ts"],
+      "@talkingo/shared/*": ["./src/shared/*"]
     }
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
-  "exclude": ["node_modules"]
+  "exclude": ["node_modules", "scripts", "next.config.ts"]
 }

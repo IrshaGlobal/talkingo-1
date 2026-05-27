@@ -1,27 +1,47 @@
 import { NextRequest, NextResponse } from 'next/server'
 import Stripe from 'stripe'
-import { upsertSubscription, updateUserPrefs } from '@/lib/appwrite-server'
+import { stripe } from '@/lib/stripe/client'
+import { STRIPE_ENV } from '@/lib/stripe/env'
+import {
+  upsertSubscription,
+  updateUserPrefs,
+  claimWebhookEvent,
+  getSubscriptionByCustomerId,
+} from '@/lib/appwrite-server'
+import { syncSubscriptionToAppwrite, detectPlanFromSubscription } from '@/lib/stripe/sync'
+
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
 
 /**
  * Stripe Webhook handler.
- * Listens for subscription events and syncs state to:
- * 1. Appwrite `subscriptions` collection (queryable, the source of truth)
- * 2. Appwrite Account Preferences (for instant cross-device client sync)
  *
- * Flow: Stripe → Webhook → Appwrite DB + Account Prefs → Client reads on login
+ * Real-time backup channel. The user's first sight of Premium happens via
+ * the post-checkout sync endpoint (no waiting for Stripe-to-us roundtrip).
+ * This webhook keeps state correct for ongoing events (renewals, payment
+ * failures, portal-driven cancellations, etc.).
+ *
+ * Idempotency: every event is claimed via `claimWebhookEvent(event.id)`.
+ * Duplicate retries are skipped silently.
  *
  * Events handled:
- * - checkout.session.completed → store customerId + mark as trialing
- * - customer.subscription.updated → sync status (active/past_due/canceled)
- * - customer.subscription.deleted → mark as expired
- * - invoice.payment_failed → mark as past_due
+ *   - checkout.session.completed   → first-sync from Stripe
+ *   - customer.subscription.created → re-subscribes via portal
+ *   - customer.subscription.updated → status, plan-change, cancel_at_period_end
+ *   - customer.subscription.deleted → mark expired
+ *   - invoice.payment_succeeded    → confirm trialing → active transition
+ *   - invoice.payment_failed       → mark past_due
  */
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2025-04-30.basil' as any,
-})
-
-const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET!
+async function resolveUserId(
+  metadataUserId: string | undefined,
+  customerId: string | null | undefined
+): Promise<string | null> {
+  if (metadataUserId) return metadataUserId
+  if (!customerId) return null
+  const existing = await getSubscriptionByCustomerId(customerId)
+  return existing?.userId ?? null
+}
 
 export async function POST(req: NextRequest) {
   const body = await req.text()
@@ -32,153 +52,123 @@ export async function POST(req: NextRequest) {
   }
 
   let event: Stripe.Event
-
   try {
-    event = stripe.webhooks.constructEvent(body, sig, webhookSecret)
+    event = stripe.webhooks.constructEvent(body, sig, STRIPE_ENV.STRIPE_WEBHOOK_SECRET)
   } catch (err: any) {
     console.error('[webhook] Signature verification failed:', err.message)
     return NextResponse.json({ error: 'Invalid signature' }, { status: 400 })
+  }
+
+  const claimed = await claimWebhookEvent(event.id, event.type)
+  if (!claimed) {
+    return NextResponse.json({ received: true, duplicate: true })
   }
 
   try {
     switch (event.type) {
       case 'checkout.session.completed': {
         const session = event.data.object as Stripe.Checkout.Session
-        const userId = session.metadata?.userId
-        const customerId = session.customer as string
-        const subscriptionId = session.subscription as string
-        const plan = session.metadata?.plan || 'monthly'
+        const customerId = typeof session.customer === 'string'
+          ? session.customer
+          : session.customer?.id ?? null
+        const subscriptionId = typeof session.subscription === 'string'
+          ? session.subscription
+          : session.subscription?.id ?? undefined
+        const userId = await resolveUserId(session.metadata?.userId, customerId)
 
-        console.log(`[webhook] Checkout completed — user: ${userId}, customer: ${customerId}`)
-
-        if (!userId) {
-          console.warn(`[webhook] ⚠️ checkout.session.completed missing metadata.userId — subscription won't sync. Customer: ${customerId}`)
+        if (!userId || !customerId || !subscriptionId) {
+          console.warn('[webhook] checkout.session.completed missing context')
+          break
         }
 
-        if (userId) {
-          // Write to subscriptions collection (source of truth)
-          await upsertSubscription(userId, {
-            stripeCustomerId: customerId,
-            stripeSubscriptionId: subscriptionId,
-            status: 'trialing',
-            plan,
-            updatedAt: Date.now(),
-          })
-
-          // Also mirror to Account Prefs (for instant client-side sync)
-          await updateUserPrefs(userId, {
-            stripeCustomerId: customerId,
-            subscriptionStatus: 'trialing',
-            subscriptionPlan: plan,
-            subscriptionUpdatedAt: Date.now(),
-          })
-
-          console.log(`[webhook] Saved subscription to DB for user: ${userId}`)
-        }
+        const subscription = await stripe.subscriptions.retrieve(subscriptionId)
+        await syncSubscriptionToAppwrite({ userId, customerId, subscription })
+        console.log(`[webhook] checkout.session.completed → ${userId}: ${subscription.status}`)
         break
       }
 
+      case 'customer.subscription.created':
       case 'customer.subscription.updated': {
-        const subscription = event.data.object as Stripe.Subscription
-        const userId = subscription.metadata?.userId
-        const status = subscription.status
-        const plan = subscription.items.data[0]?.price?.recurring?.interval === 'year' ? 'yearly' : 'monthly'
-        const customerId = typeof subscription.customer === 'string' ? subscription.customer : subscription.customer.id
-
-        console.log(`[webhook] Subscription updated — user: ${userId}, status: ${status}`)
+        const sub = event.data.object as Stripe.Subscription
+        const customerId = typeof sub.customer === 'string' ? sub.customer : sub.customer.id
+        const userId = await resolveUserId(sub.metadata?.userId, customerId)
 
         if (!userId) {
-          console.warn(`[webhook] ⚠️ subscription.updated missing metadata.userId — status won't sync. Customer: ${customerId}`)
+          console.warn(`[webhook] ${event.type} — could not resolve userId for customer ${customerId}`)
+          break
         }
 
-        if (userId) {
-          await upsertSubscription(userId, {
-            stripeCustomerId: customerId,
-            stripeSubscriptionId: subscription.id,
-            status,
-            plan,
-            trialEnd: subscription.trial_end ? (subscription.trial_end as number) * 1000 : undefined,
-            periodEnd: (subscription as any).current_period_end ? (subscription as any).current_period_end * 1000 : undefined,
-            updatedAt: Date.now(),
-          })
-
-          await updateUserPrefs(userId, {
-            subscriptionStatus: status,
-            subscriptionPlan: plan,
-            subscriptionUpdatedAt: Date.now(),
-            ...(subscription.trial_end && {
-              subscriptionTrialEnd: (subscription.trial_end as number) * 1000,
-            }),
-            ...((subscription as any).current_period_end && {
-              subscriptionPeriodEnd: (subscription as any).current_period_end * 1000,
-            }),
-          })
-
-          console.log(`[webhook] Updated subscription in DB: ${status}`)
-        }
+        await syncSubscriptionToAppwrite({ userId, customerId, subscription: sub })
+        console.log(`[webhook] ${event.type} → ${userId}: ${sub.status}`)
         break
       }
 
       case 'customer.subscription.deleted': {
-        const subscription = event.data.object as Stripe.Subscription
-        const userId = subscription.metadata?.userId
-        const customerId = typeof subscription.customer === 'string' ? subscription.customer : subscription.customer.id
+        const sub = event.data.object as Stripe.Subscription
+        const customerId = typeof sub.customer === 'string' ? sub.customer : sub.customer.id
+        const userId = await resolveUserId(sub.metadata?.userId, customerId)
+        if (!userId) break
 
-        console.log(`[webhook] Subscription cancelled — user: ${userId}`)
+        await upsertSubscription(userId, {
+          stripeCustomerId: customerId,
+          stripeSubscriptionId: sub.id,
+          status: 'expired',
+          plan: detectPlanFromSubscription(sub),
+          cancelAtPeriodEnd: false,
+          updatedAt: Date.now(),
+        })
+        await updateUserPrefs(userId, {
+          subscriptionStatus: 'expired',
+          subscriptionUpdatedAt: Date.now(),
+        })
+        console.log(`[webhook] subscription.deleted → ${userId}`)
+        break
+      }
 
-        if (!userId) {
-          console.warn(`[webhook] ⚠️ subscription.deleted missing metadata.userId — expiry won't sync. Customer: ${customerId}`)
-        }
+      case 'invoice.payment_succeeded': {
+        const invoice = event.data.object as Stripe.Invoice
+        const subscriptionId = (invoice as any).subscription as string | undefined
+        const customerId = invoice.customer as string
+        if (!subscriptionId) break
 
-        if (userId) {
-          await upsertSubscription(userId, {
-            stripeCustomerId: customerId,
-            stripeSubscriptionId: subscription.id,
-            status: 'expired',
-            plan: subscription.items.data[0]?.price?.recurring?.interval === 'year' ? 'yearly' : 'monthly',
-            updatedAt: Date.now(),
-          })
-
-          await updateUserPrefs(userId, {
-            subscriptionStatus: 'expired',
-            subscriptionUpdatedAt: Date.now(),
-          })
-
-          console.log(`[webhook] Marked subscription as expired for user: ${userId}`)
+        try {
+          const sub = await stripe.subscriptions.retrieve(subscriptionId)
+          const userId = await resolveUserId(sub.metadata?.userId, customerId)
+          if (!userId) break
+          await syncSubscriptionToAppwrite({ userId, customerId, subscription: sub })
+          console.log(`[webhook] invoice.payment_succeeded → ${userId}: ${sub.status}`)
+        } catch (err) {
+          console.error('[webhook] payment_succeeded handler error:', err)
         }
         break
       }
 
       case 'invoice.payment_failed': {
         const invoice = event.data.object as Stripe.Invoice
+        const subscriptionId = (invoice as any).subscription as string | undefined
         const customerId = invoice.customer as string
-        const subscriptionId = (invoice as any).subscription as string
+        if (!subscriptionId) break
 
-        console.log(`[webhook] Payment failed — customer: ${customerId}`)
+        try {
+          const sub = await stripe.subscriptions.retrieve(subscriptionId)
+          const userId = await resolveUserId(sub.metadata?.userId, customerId)
+          if (!userId) break
 
-        if (subscriptionId) {
-          try {
-            const sub = await stripe.subscriptions.retrieve(subscriptionId)
-            const userId = sub.metadata?.userId
-            if (userId) {
-              await upsertSubscription(userId, {
-                stripeCustomerId: customerId,
-                stripeSubscriptionId: subscriptionId,
-                status: 'past_due',
-                plan: sub.items.data[0]?.price?.recurring?.interval === 'year' ? 'yearly' : 'monthly',
-                updatedAt: Date.now(),
-              })
-
-              await updateUserPrefs(userId, {
-                subscriptionStatus: 'past_due',
-                subscriptionUpdatedAt: Date.now(),
-              })
-
-              console.log(`[webhook] Marked subscription as past_due for user: ${userId}`)
-            }
-          } catch (err) {
-            console.error('[webhook] Could not retrieve subscription for payment_failed:', err)
-          }
+          await upsertSubscription(userId, {
+            stripeCustomerId: customerId,
+            stripeSubscriptionId: subscriptionId,
+            status: 'past_due',
+            plan: detectPlanFromSubscription(sub),
+            cancelAtPeriodEnd: (sub as any).cancel_at_period_end ?? false,
+            updatedAt: Date.now(),
+          })
+          await updateUserPrefs(userId, {
+            subscriptionStatus: 'past_due',
+            subscriptionUpdatedAt: Date.now(),
+          })
+          console.log(`[webhook] invoice.payment_failed → ${userId}: past_due`)
+        } catch (err) {
+          console.error('[webhook] payment_failed handler error:', err)
         }
         break
       }

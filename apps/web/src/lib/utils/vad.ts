@@ -1,9 +1,22 @@
 /**
- * Voice Activity Detector (VAD) with Echo Cancellation
- * 
- * Monitors audio stream energy to detect when a user starts speaking.
- * Uses Acoustic Echo Cancellation (AEC) to prevent the AI's own voice
- * from triggering the interruption logic.
+ * Voice Activity Detector (VAD)
+ *
+ * Monitors mic energy and fires `onSpeechStart` when sustained voice activity
+ * is detected. Used by live mode to interrupt the AI when the user starts
+ * speaking.
+ *
+ * Self-interrupt prevention
+ * -------------------------
+ * On devices without headphones, the AI's voice bleeds from the speaker into
+ * the mic. Even with `getUserMedia`'s built-in echo cancellation, the residual
+ * signal is often loud enough to clear a low RMS threshold and produce a
+ * spurious "user is talking" event — which then interrupts the AI mid-sentence.
+ *
+ * To prevent this, callers should toggle `setActive(false)` whenever the AI
+ * is producing audio (and a short tail afterwards) and `setActive(true)`
+ * once the AI is silent again. While inactive, the analyser still runs (so
+ * we never miss a real speech onset that arrives the same frame the AI
+ * goes silent) but the speech-frame counter is suppressed.
  */
 export class VoiceActivityDetector {
   private audioContext: AudioContext | null = null
@@ -11,13 +24,15 @@ export class VoiceActivityDetector {
   private mediaStream: MediaStream | null = null
   private rafId: number | null = null
   private onSpeechStart: (() => void) | null = null
-  
-  // Echo Cancellation Nodes
-  private echoSource: MediaStreamAudioSourceNode | null = null
-  private echoDestination: MediaStreamAudioDestinationNode | null = null
-  
-  // Thresholds
-  private readonly SILENCE_THRESHOLD = 0.03
+
+  /** When false, mic energy is observed but the speech callback is suppressed. */
+  private active = true
+  /** Reset moment — energy before this timestamp is ignored (used after un-gating). */
+  private gateUntil = 0
+
+  // Thresholds. Slightly higher than the previous 0.03 to ride out passive
+  // speaker bleed during quiet AI passages without missing real speech.
+  private readonly SILENCE_THRESHOLD = 0.05
   private readonly SPEECH_FRAMES = 3
 
   constructor(onSpeechStart: () => void) {
@@ -29,34 +44,23 @@ export class VoiceActivityDetector {
 
     this.mediaStream = stream
     this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)()
-    
-    // 1. Setup Microphone Input
+
     const micSource = this.audioContext.createMediaStreamSource(stream)
-    
-    // 2. Setup Echo Reference (This is where we'll feed the AI's audio later)
-    this.echoDestination = this.audioContext.createMediaStreamDestination()
-    
-    // 3. Create Analyser for VAD
     this.analyser = this.audioContext.createAnalyser()
     this.analyser.fftSize = 512
     this.analyser.smoothingTimeConstant = 0.3
-
-    // 4. Connect Mic -> Analyser
-    // Note: In a real AEC setup, we'd use a dedicated AEC node or the browser's built-in
-    // echoCancellation in getUserMedia constraints. Since we are using a raw stream,
-    // we rely on the browser's internal AEC if available, or simple gating here.
     micSource.connect(this.analyser)
-    
+
     const bufferLength = this.analyser.frequencyBinCount
     const dataArray = new Uint8Array(bufferLength)
     let speechFrameCount = 0
 
     const detect = () => {
       if (!this.analyser) return
-      
+
       this.analyser.getByteFrequencyData(dataArray)
-      
-      // Calculate RMS-like energy
+
+      // RMS-like energy across the frequency bins.
       let sum = 0
       for (let i = 0; i < bufferLength; i++) {
         const val = (dataArray[i] - 128) / 128.0
@@ -64,7 +68,13 @@ export class VoiceActivityDetector {
       }
       const rms = Math.sqrt(sum / bufferLength)
 
-      if (rms > this.SILENCE_THRESHOLD) {
+      // Suppress while the AI is talking, or during the small post-speech
+      // tail. The `gateUntil` window absorbs late audio chunks still being
+      // emitted by the speaker after `setActive(true)` was called.
+      const now = performance.now()
+      const gated = !this.active || now < this.gateUntil
+
+      if (!gated && rms > this.SILENCE_THRESHOLD) {
         speechFrameCount++
         if (speechFrameCount >= this.SPEECH_FRAMES) {
           this.onSpeechStart?.()
@@ -81,30 +91,26 @@ export class VoiceActivityDetector {
   }
 
   /**
-   * Feed the AI's audio stream into the echo canceller.
-   * This helps the VAD distinguish between "AI speaking" and "User speaking".
+   * Toggle whether speech detection is currently armed. When transitioning
+   * from inactive → active a short cooldown is applied so any audio still
+   * decaying out of the speaker doesn't immediately fire a false interrupt.
    */
-  setEchoReference(stream: MediaStream) {
-    if (!this.audioContext || !this.echoDestination) return
-    
-    // Stop previous reference if exists
-    if (this.echoSource) {
-      this.echoSource.disconnect()
+  setActive(active: boolean) {
+    if (this.active === active) return
+    this.active = active
+    if (active) {
+      // 350 ms cooldown after the AI stops — long enough for residual
+      // playback to fade, short enough to feel responsive.
+      this.gateUntil = performance.now() + 350
     }
-
-    this.echoSource = this.audioContext.createMediaStreamSource(stream)
-    // Connect AI audio to the destination so it can be referenced for cancellation
-    this.echoSource.connect(this.echoDestination)
   }
 
   stop() {
     if (this.rafId) cancelAnimationFrame(this.rafId)
-    if (this.echoSource) this.echoSource.disconnect()
     if (this.audioContext) this.audioContext.close()
     this.audioContext = null
     this.analyser = null
     this.mediaStream = null
-    this.echoSource = null
-    this.echoDestination = null
+    this.rafId = null
   }
 }

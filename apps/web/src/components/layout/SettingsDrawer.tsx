@@ -17,7 +17,7 @@ import { AvatarSVG } from '../ui/AvatarSVG'
 import { AI_PERSONAS, isPersonaUnlocked, getPersonaById } from '@talkingo/shared/gemini/personas'
 import type { PersonaId, DomainScores } from '@talkingo/shared/types'
 import { LANGUAGES } from '@talkingo/shared/languages'
-import { getConversations, deleteConversation, formatDuration, formatDate, type SavedConversation } from '@/lib/utils/conversation-history'
+import { loadAllSessions, deleteSession, clearAllSessions, formatDuration, formatSessionDate } from '@/lib/storage/chat-sessions'
 import { updateUserName } from '@/lib/auth/auth'
 import { VoicePicker } from '../settings/VoicePicker'
 

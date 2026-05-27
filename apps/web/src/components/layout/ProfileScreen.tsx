@@ -9,8 +9,11 @@ import {
 } from 'lucide-react'
 import { useAuth } from '@/context/AuthContext'
 import { AvatarSVG } from '../ui/AvatarSVG'
-import { isSubscribed, getSubscriptionInfo } from '@/lib/subscription/use-subscription'
+import { isSubscribed, getSubscriptionInfo, getNextBillingLabel, getTrialCountdownLabel } from '@/lib/subscription/use-subscription'
 import { getRemainingMessages } from '@/lib/subscription/free-tier'
+import { authFetch } from '@/lib/api/auth-fetch'
+import { Paywall } from '../paywall/Paywall'
+import { SubscriptionManager } from '../paywall/SubscriptionManager'
 import { AI_PERSONAS, isPersonaUnlocked } from '@talkingo/shared/gemini/personas'
 import type { PersonaId, DomainScores } from '@talkingo/shared/types'
 import { LANGUAGES } from '@talkingo/shared/languages'
@@ -89,6 +92,9 @@ export function ProfileScreen({
   const previewAudioRef = useRef<AudioBufferSourceNode | null>(null)
   const previewElRef = useRef<HTMLAudioElement | null>(null)
 
+  // Paywall trigger from "Subscribe to Premium" button
+  const [showPaywall, setShowPaywall] = useState(false)
+
   const handleChatVoiceChange = (voice: string) => {
     setChatVoice(voice)
     localStorage.setItem(`talkingo_chat_voice_${currentPersona}`, voice)
@@ -124,7 +130,7 @@ export function ProfileScreen({
     }
 
     try {
-      const res = await fetch('/api/gemini/tts', {
+      const res = await authFetch('/api/gemini/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -552,58 +558,28 @@ export function ProfileScreen({
         {user && (
           <section>
             <h2 className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground/70 mb-3 px-1">Subscription</h2>
-            <div className="rounded-2xl bg-card/50 border border-border/30 p-4 space-y-3">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm font-semibold text-foreground">
-                    {isSubscribed(user.id) ? 'Talkingo Premium' : 'Free Plan'}
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    {isSubscribed(user.id)
-                      ? 'Manage your plan, billing, and payment methods'
-                      : `${getRemainingMessages(user.id)} messages remaining today`
-                    }
-                  </p>
+            {isSubscribed(user.id) ? (
+              <SubscriptionManager userId={user.id} />
+            ) : (
+              <div className="rounded-2xl bg-card/50 border border-border/30 p-4 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-semibold text-foreground">Free Plan</p>
+                    <p className="text-xs text-muted-foreground">
+                      {getRemainingMessages(user.id)} messages remaining today
+                    </p>
+                  </div>
+                  <Crown className="w-5 h-5 text-muted-foreground/40" />
                 </div>
-                <Crown className={`w-5 h-5 ${isSubscribed(user.id) ? 'text-primary' : 'text-muted-foreground/40'}`} />
+                <button
+                  onClick={() => setShowPaywall(true)}
+                  className="w-full px-4 py-2.5 rounded-xl bg-primary/8 border border-primary/20 text-sm font-medium text-primary hover:bg-primary/14 transition-all flex items-center justify-center gap-2"
+                >
+                  <Crown className="w-4 h-4" />
+                  Subscribe to Premium
+                </button>
               </div>
-              <button
-                onClick={async () => {
-                  try {
-                    const info = localStorage.getItem(`talkingo_subscription_${user.id}`)
-                    const customerId = info ? JSON.parse(info).customerId : null
-                    if (!customerId) {
-                      // No subscription yet — redirect to checkout (monthly by default)
-                      const res = await fetch('/api/stripe/checkout', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ plan: 'monthly', email: user.email, userId: user.id }),
-                      })
-                      const { url } = await res.json()
-                      if (url) window.location.href = url
-                      return
-                    }
-                    const res = await fetch('/api/stripe/portal', {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ customerId }),
-                    })
-                    const { url } = await res.json()
-                    if (url) window.location.href = url
-                  } catch { alert('Could not open billing portal') }
-                }}
-                className="w-full px-4 py-2.5 rounded-xl bg-primary/8 border border-primary/20 text-sm font-medium text-primary hover:bg-primary/14 transition-all flex items-center justify-center gap-2"
-              >
-                <CreditCard className="w-4 h-4" />
-                {(() => {
-                  try {
-                    const info = localStorage.getItem(`talkingo_subscription_${user.id}`)
-                    const parsed = info ? JSON.parse(info) : null
-                    return parsed?.customerId ? 'Manage Subscription' : 'Subscribe Now'
-                  } catch { return 'Subscribe Now' }
-                })()}
-              </button>
-            </div>
+            )}
           </section>
         )}
 
@@ -619,6 +595,15 @@ export function ProfileScreen({
         )}
 
       </div>
+
+      {/* Subscribe-from-profile paywall */}
+      {showPaywall && user && (
+        <Paywall
+          userEmail={user.email}
+          userId={user.id}
+          onClose={() => setShowPaywall(false)}
+        />
+      )}
     </div>
   )
 }

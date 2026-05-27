@@ -2,21 +2,19 @@
 
 import { useEffect, useRef, useState } from 'react'
 import {
-  Sparkles, Play, Flame, BookOpen,
-  ArrowRight, MessageCircle, Phone, Send, GraduationCap, Headphones, Lock, Crown,
+  Sparkles, Play, Flame,
+  ArrowRight, MessageCircle, Phone, Send, GraduationCap, Headphones, Lock, Target,
 } from 'lucide-react'
 import { cn } from '@talkingo/shared/utils'
 import { isSubscribed } from '@/lib/subscription/use-subscription'
 import { useAuth } from '@/context/AuthContext'
-import { isModeAllowed } from '@/lib/subscription/free-tier'
 import type {
   LanguageProgress, UserPreferences, TargetLanguage,
   CefrLevel,
 } from '@talkingo/shared/types'
 import { getLanguageMeta } from '@talkingo/shared/languages'
 import { cefrToTalkingoLevel, getLevelByNumber } from '@talkingo/shared/levels'
-import { FREE_TALK_SCENARIO } from '@talkingo/shared/curriculum'
-import { hasPreviousSession, getMostRecentMemory } from '@/lib/storage/conversation-memory'
+import { loadProfileLocal, getNextRecommendation, type LearnerProfile, type NextRecommendation } from '@/lib/learning'
 
 interface TalkScreenProps {
   preferences: UserPreferences
@@ -42,22 +40,30 @@ export function TalkScreen({
   const { user } = useAuth()
   const isPremium = isSubscribed(user?.id)
   const [mounted, setMounted] = useState(false)
+  const [profile, setProfile] = useState<LearnerProfile | null>(null)
+
   useEffect(() => setMounted(true), [])
+
+  // Load the unified LearnerProfile (instant from localStorage cache)
+  useEffect(() => {
+    const targetLang = preferences.targetLanguage || 'en'
+    const p = loadProfileLocal(userId, targetLang as TargetLanguage)
+    setProfile(p)
+  }, [userId, preferences.targetLanguage])
 
   const lang = getLanguageMeta(preferences.targetLanguage)
   const userCefr: CefrLevel = progress?.cefr ?? preferences.cefr ?? 'A1'
-  const talkingoLevel = cefrToTalkingoLevel(userCefr)
+  const talkingoLevel = profile?.level ?? cefrToTalkingoLevel(userCefr)
   const levelInfo = getLevelByNumber(talkingoLevel)
 
-  const resolvedUserId = userId || ''
-  const hasPrevSession = resolvedUserId && hasPreviousSession(
-    resolvedUserId, preferences.persona || 'eli', preferences.targetLanguage || 'en'
-  )
-  const recentMemory = resolvedUserId ? getMostRecentMemory(resolvedUserId) : null
+  // Get smart recommendation based on profile
+  const recommendation: NextRecommendation | null = profile && profile.sessionCount > 0
+    ? getNextRecommendation(profile)
+    : null
 
-  const streak  = progress?.streakDays ?? 0
-  const minutes = progress?.totalMinutes ?? 0
-  const sessions = progress?.totalSessions ?? 0
+  const streak  = profile?.streak ?? progress?.streakDays ?? 0
+  const minutes = profile?.totalMinutes ?? progress?.totalMinutes ?? 0
+  const sessions = profile?.sessionCount ?? progress?.totalSessions ?? 0
 
   return (
     <div className="flex-1 flex flex-col items-center justify-center px-5 sm:px-6 pb-20">
@@ -121,30 +127,28 @@ export function TalkScreen({
           </div>
         </div>
 
-        {/* ── Continue last session ── */}
-        {hasPrevSession && recentMemory && (
+        {/* ── Recommended next session (smart, profile-driven) ── */}
+        {recommendation && (
           <button
-            onClick={() => onStartSession(recentMemory.lastScenarioId || FREE_TALK_SCENARIO.id, 'continue')}
+            onClick={() => onStartSession(recommendation.scenarioId, 'continue')}
             className={cn(
               'w-full flex items-center gap-3 px-4 py-3.5 rounded-2xl',
-              'bg-card/70 border border-border/50 shadow-sm',
-              'hover:border-primary/40 hover:bg-card/85 hover:shadow-md transition-all group'
+              'bg-gradient-to-br from-primary/8 to-secondary/4 border border-primary/30 shadow-sm',
+              'hover:border-primary/50 hover:shadow-md transition-all group'
             )}
           >
-            <div className="w-9 h-9 rounded-2xl bg-primary/12 flex items-center justify-center flex-shrink-0 group-hover:bg-primary/18 transition-colors">
-              <Play className="w-4 h-4 text-primary fill-current ml-0.5" />
+            <div className="w-9 h-9 rounded-2xl bg-primary/15 flex items-center justify-center flex-shrink-0 group-hover:bg-primary/25 transition-colors">
+              <Target className="w-4 h-4 text-primary" />
             </div>
             <div className="flex-1 min-w-0 text-left">
-              <span className="text-sm font-semibold text-foreground block leading-tight">Continue last session</span>
-              {recentMemory.lastTopics.length > 0 && (
-                <span className="text-xs text-muted-foreground truncate block mt-0.5">
-                  {recentMemory.lastTopics.slice(0, 2).join(' · ')}
-                </span>
-              )}
+              <span className="text-sm font-semibold text-foreground block leading-tight">
+                {recommendation.title}
+              </span>
+              <span className="text-xs text-primary/70 truncate block mt-0.5 font-medium">
+                {recommendation.reason}
+              </span>
             </div>
-            <span className="text-[11px] text-muted-foreground font-medium flex-shrink-0">
-              {formatLastSession(recentMemory.lastSessionAt)}
-            </span>
+            <ArrowRight className="w-4 h-4 text-primary/60 flex-shrink-0 group-hover:translate-x-0.5 transition-transform" />
           </button>
         )}
 
@@ -296,16 +300,6 @@ function greetingByTime(): string {
   if (h < 17) return 'Good afternoon'
   if (h < 22) return 'Good evening'
   return 'Late night'
-}
-
-function formatLastSession(timestamp: number): string {
-  const diff = Date.now() - timestamp
-  const m = Math.floor(diff / 60000)
-  const h = Math.floor(diff / 3600000)
-  const d = Math.floor(diff / 86400000)
-  if (m < 60) return `${m}m ago`
-  if (h < 24) return `${h}h ago`
-  return `${d}d ago`
 }
 
 export type { TargetLanguage }

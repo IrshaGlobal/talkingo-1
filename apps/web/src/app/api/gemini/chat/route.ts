@@ -12,14 +12,11 @@ import {
   buildOnboardingOpenerPrompt,
   buildRegisterAlternativesSystemInstruction,
   buildRegisterAlternativesPrompt,
-  buildMemoryUpdateSystemInstruction,
-  buildMemoryUpdatePrompt,
   parseConversationResponse,
   parseOpenerResponse,
   parseAssessmentResponse,
   parseRecapResponse,
   parseRegisterAlternatives,
-  parseMemoryUpdate,
 } from '@talkingo/shared/gemini'
 import { getPersonaById } from '@talkingo/shared/gemini/personas'
 import type {
@@ -73,7 +70,7 @@ interface ChatRequest {
     | 'onboarding-turn'
     | 'onboarding-assess'
     | 'register-alternatives'
-    | 'memory-update'
+    | 'session-digest'
   userText?: string
   state?: ConversationState
   history?: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }>
@@ -102,12 +99,8 @@ interface ChatRequest {
     conversationContext?: string
   }
   // character memory update
-  memoryRequest?: {
-    personaId: PersonaId
-    previousSummary: string
-    knownFacts: string[]
-    transcript: Array<{ role: 'user' | 'ai'; text: string }>
-  }
+  // session digest (new learning system)
+  digestPrompt?: string
 }
 
 export async function POST(req: NextRequest) {
@@ -121,10 +114,11 @@ export async function POST(req: NextRequest) {
 
     // ── Auth: verify user has a valid session ────────────────────────────
     const { verifyAuth, checkRateLimit } = await import('@/lib/api/auth-guard')
-    const userId = await verifyAuth(req)
-    if (!userId) {
+    const auth = await verifyAuth(req)
+    if (!auth) {
       return NextResponse.json({ error: 'unauthorized' }, { status: 401 })
     }
+    const { userId, jwt } = auth
 
     // ── Rate limit: 60 requests per minute per user ──────────────────────
     const { allowed, remaining } = checkRateLimit(`gemini:${userId}`, 60, 60_000)
@@ -138,19 +132,22 @@ export async function POST(req: NextRequest) {
     // ── Free tier enforcement (server-side) ──────────────────────────────
     // Only enforce on conversation messages (not onboarding, assessment, etc.)
     if (type === 'message') {
-      const { getSubscription } = await import('@/lib/appwrite-server')
-      const subscription = await getSubscription(userId)
+      const { getSubscription, incrementFreeUsage } = await import('@/lib/appwrite-server')
+      // Read subscription as the user (their JWT) — respects per-doc permissions
+      const subscription = await getSubscription(userId, jwt)
       const isActive = subscription?.status === 'active' || subscription?.status === 'trialing'
 
       if (!isActive) {
-        // Check daily message count (server-side, per-user, stored in rate limit store)
+        // Persistent daily counter (Appwrite collection — survives cold starts).
+        // The free_tier_usage collection is admin-only so users can't tamper.
         const FREE_DAILY_LIMIT = 6
-        const dayKey = new Date().toISOString().split('T')[0]
-        const usageKey = `free:${userId}:${dayKey}`
-        const { allowed: withinLimit } = checkRateLimit(usageKey, FREE_DAILY_LIMIT, 24 * 60 * 60_000)
-        if (!withinLimit) {
+        const newCount = await incrementFreeUsage(userId)
+        if (newCount > FREE_DAILY_LIMIT) {
           return NextResponse.json(
-            { error: 'free_limit_reached', message: 'Daily message limit reached. Upgrade for unlimited conversations.' },
+            {
+              error: 'free_limit_reached',
+              message: 'Daily message limit reached. Upgrade for unlimited conversations.',
+            },
             { status: 429 }
           )
         }
@@ -232,22 +229,22 @@ export async function POST(req: NextRequest) {
         return NextResponse.json(parseRegisterAlternatives(raw))
       }
 
-      // ── Character memory update (rolling summary) ──
-      if (type === 'memory-update') {
-        if (!body.memoryRequest) {
-          return NextResponse.json({ error: 'bad_request', message: 'memoryRequest missing' }, { status: 400 })
+      // ── Session digest (new learning system) ──
+      if (type === 'session-digest') {
+        if (!body.digestPrompt) {
+          return NextResponse.json({ error: 'bad_request', message: 'digestPrompt missing' }, { status: 400 })
         }
-        const persona = getPersonaById(body.memoryRequest.personaId)
-        const personaName = persona?.name ?? 'the AI'
-        const sysInstr = buildMemoryUpdateSystemInstruction(personaName)
-        const prompt = buildMemoryUpdatePrompt({
-          personaName,
-          previousSummary: body.memoryRequest.previousSummary,
-          knownFacts: body.memoryRequest.knownFacts,
-          transcript: body.memoryRequest.transcript,
-        })
-        const raw = await callAIWithFallback(sysInstr, prompt, [])
-        return NextResponse.json(parseMemoryUpdate(raw))
+        const sysInstr = `You are a language learning analyst. Analyze the conversation transcript and produce a structured session digest. Return ONLY valid JSON matching the schema in the prompt. Be specific and concrete — never generic.`
+        const raw = await callAIWithFallback(sysInstr, body.digestPrompt, [])
+        try {
+          return NextResponse.json(JSON.parse(raw))
+        } catch {
+          const jsonMatch = raw.match(/\{[\s\S]*\}/)
+          if (jsonMatch) {
+            return NextResponse.json(JSON.parse(jsonMatch[0]))
+          }
+          return NextResponse.json({ error: 'parse_error', raw }, { status: 500 })
+        }
       }
 
       // ── Conversation (opener / message) ──

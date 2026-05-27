@@ -867,6 +867,13 @@ select.custom-scrollbar { scrollbar-width: thin; scrollbar-color: hsl(var(--prim
 @keyframes loading-slide { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
 .animate-loading-slide { animation: loading-slide 1.5s ease-in-out infinite; }
 
+@keyframes loading-bar {
+  0%   { transform: translateX(-100%); }
+  50%  { transform: translateX(150%); }
+  100% { transform: translateX(350%); }
+}
+.animate-loading-bar { animation: loading-bar 1.8s cubic-bezier(0.4, 0, 0.2, 1) infinite; }
+
 /* ─── Correction highlight (inline error tooltip) ────────────────────────── */
 .correction-highlight {
   position: relative;
@@ -1187,4 +1194,115 @@ html.dark .toggle-switch-thumb-apple { background: hsl(var(--card-elevated)); bo
     scroll-behavior: auto !important;
   }
   .ambient-orb, .control-ambient-glow { animation: none !important; }
+}
+
+/* ─── PWA · Native App Behavior ──────────────────────────────────────────── */
+
+/* Prevent pull-to-refresh in standalone mode (feels native) */
+@media all and (display-mode: standalone) {
+  html {
+    overscroll-behavior-y: contain;
+  }
+  
+  body {
+    /* Prevent rubber-banding on iOS */
+    overscroll-behavior: none;
+    -webkit-overflow-scrolling: touch;
+    /* Prevent text selection on long-press (native feel) */
+    -webkit-user-select: none;
+    user-select: none;
+    /* Prevent callout on long-press */
+    -webkit-touch-callout: none;
+  }
+
+  /* Re-enable text selection for actual content areas */
+  input, textarea, [contenteditable="true"],
+  .selectable, p, span, h1, h2, h3, h4, h5, h6 {
+    -webkit-user-select: text;
+    user-select: text;
+  }
+
+  /* Safe area insets for notched devices */
+  .home-shell {
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-left: env(safe-area-inset-left, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+  }
+
+  /* Status bar area background in standalone mode */
+  body::after {
+    content: '';
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: env(safe-area-inset-top, 0px);
+    background: hsl(var(--card) / 0.9);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    z-index: 9999;
+    pointer-events: none;
+  }
+}
+
+/* Standalone mode detection for bottom safe area */
+@media all and (display-mode: standalone) {
+  .safe-area-bottom {
+    padding-bottom: max(env(safe-area-inset-bottom, 0px), 20px);
+  }
+}
+
+/* Prevent zoom on input focus (iOS) */
+@media screen and (max-width: 768px) {
+  input[type="text"],
+  input[type="email"],
+  input[type="password"],
+  input[type="number"],
+  input[type="tel"],
+  input[type="url"],
+  textarea,
+  select {
+    font-size: 16px !important;
+  }
+}
+
+/* Smooth transitions for PWA install prompt */
+@keyframes slide-in-from-bottom {
+  from {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.animate-in {
+  animation: slide-in-from-bottom 0.3s var(--ease-out-expo) forwards;
+}
+
+/* Hide browser UI elements in standalone */
+@media all and (display-mode: standalone) {
+  /* Ensure full-screen feel */
+  html, body {
+    height: 100%;
+    overflow: hidden;
+  }
+  
+  #__next, main, .home-shell {
+    height: 100%;
+  }
+}
+
+/* Touch feedback for interactive elements (native feel) */
+@media (hover: none) and (pointer: coarse) {
+  button, a, [role="button"], .scenario-card, .settings-row {
+    -webkit-tap-highlight-color: hsl(var(--primary) / 0.1);
+  }
+  
+  button:active, a:active, [role="button"]:active {
+    opacity: 0.85;
+    transition: opacity 0.05s ease;
+  }
 }

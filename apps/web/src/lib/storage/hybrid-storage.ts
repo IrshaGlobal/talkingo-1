@@ -1,30 +1,20 @@
 /**
- * Hybrid storage orchestrator.
+ * Hybrid storage orchestrator — preferences only.
  *
- * STORAGE STRATEGY (optimized):
- * - Appwrite DB: preferences + language_progress + session_analytics (irreplaceable)
- * - localStorage: conversations, settings, preferences cache, progress cache (reconstructable)
- * - In-memory: corrections, vocab, signals, transcript (session-scoped, discarded at end)
+ * STORAGE STRATEGY (simplified):
+ * - Appwrite DB: user_preferences + learner_profiles (irreplaceable, cross-device)
+ * - localStorage: chat sessions (auto-saved transcripts), settings, profile cache
  *
- * Per-session DB I/O: 1 read (~5KB at start) + 2 writes (~5.5KB at end) = ~10.5KB total.
- * Zero DB writes during active session — all accumulation happens in-memory.
+ * The old conversation transcript saving and language_progress sync was removed
+ * — those responsibilities now live in chat-sessions.ts and learner-profile.
  */
 
-import type { UserPreferences, LanguageProgress, TargetLanguage } from '@talkingo/shared/types'
-import type { SavedConversation } from '../utils/conversation-history'
+import type { UserPreferences } from '@talkingo/shared/types'
 import {
   saveUserPreferences,
   getUserPreferences,
-  saveLanguageProgress,
-  getLanguageProgress,
 } from './appwrite-storage'
 import { updateAccountPrefs, type AccountPrefsPayload } from '../auth/auth'
-import {
-  saveConversation as saveConvLocal,
-  getConversations as getConvLocal,
-  deleteConversation as deleteConvLocal,
-  clearAllConversations as clearAllLocal,
-} from '../utils/conversation-history'
 import { validatePreferences } from '../utils/onboarding-check'
 
 // ─── Settings Storage Interface ──────────────────────────────────────────────
@@ -54,7 +44,6 @@ export function isOnboarded(userId?: string | null): boolean {
   try {
     const key = onboardedKey(userId || null)
     if (localStorage.getItem(key) === 'true') return true
-    // Backwards-compat: if prefs exist for this user, treat as onboarded.
     const prefs = localStorage.getItem(prefsKey(userId || null))
     if (prefs) {
       try {
@@ -81,10 +70,6 @@ export function markOnboarded(userId?: string | null): void {
 
 // ─── Preferences Storage ─────────────────────────────────────────────────────
 
-/**
- * Pulls the essential onboarding fields out of UserPreferences for mirroring
- * to Appwrite Account Preferences.
- */
 function essentialPrefsForAccount(p: UserPreferences): AccountPrefsPayload {
   return {
     onboardingComplete: p.onboardingComplete,
@@ -103,9 +88,6 @@ function essentialPrefsForAccount(p: UserPreferences): AccountPrefsPayload {
   }
 }
 
-/**
- * Reconstructs a UserPreferences object from Account Preferences.
- */
 export function preferencesFromAccountPrefs(
   ap: AccountPrefsPayload | null | undefined
 ): UserPreferences | null {
@@ -132,18 +114,15 @@ export async function savePreferences(
   preferences: UserPreferences,
   isAuthenticated: boolean
 ): Promise<void> {
-  // Validate preferences before saving
   const validation = validatePreferences(preferences)
   if (!validation.isValid) {
     console.warn('[Storage] Saving incomplete preferences:', {
       userId,
       missingFields: validation.missingFields,
-      preferences,
     })
   }
 
   const key = prefsKey(userId)
-  // Always save to localStorage as cache
   try {
     localStorage.setItem(key, JSON.stringify(preferences))
     if (preferences.onboardingComplete) markOnboarded(userId)
@@ -151,7 +130,6 @@ export async function savePreferences(
     console.error('[Storage] Failed to save preferences to localStorage:', error)
   }
 
-  // If authenticated, sync to both backend stores in parallel
   if (isAuthenticated && userId) {
     const results = await Promise.allSettled([
       updateAccountPrefs(essentialPrefsForAccount(preferences)),
@@ -173,15 +151,13 @@ export async function loadPreferences(
   isAuthenticated: boolean,
   accountPrefs?: AccountPrefsPayload | null
 ): Promise<UserPreferences | null> {
-  // ── Path 1: Account Prefs (instant, zero-network, bulletproof) ──────────
+  // Path 1: Account Prefs (instant, zero-network)
   const fromAccount = preferencesFromAccountPrefs(accountPrefs)
   if (fromAccount && fromAccount.onboardingComplete) {
-    // Cache to localStorage
     try {
       localStorage.setItem(prefsKey(userId), JSON.stringify(fromAccount))
     } catch { /* ignore */ }
 
-    // Best-effort: enrich with the full document in the background
     if (isAuthenticated && userId) {
       void getUserPreferences(userId).then(doc => {
         if (!doc) return
@@ -195,7 +171,7 @@ export async function loadPreferences(
     return fromAccount
   }
 
-  // ── Path 2: user_preferences document (full data) ──────────────────────
+  // Path 2: user_preferences document
   let backendPrefs: UserPreferences | null = null
   if (isAuthenticated && userId) {
     try {
@@ -218,7 +194,6 @@ export async function loadPreferences(
           localStorage.setItem(prefsKey(userId), JSON.stringify(backendPrefs))
         } catch { /* ignore */ }
 
-        // Self-healing: push to account prefs if stale
         if (backendPrefs.onboardingComplete && !accountPrefs?.onboardingComplete) {
           void updateAccountPrefs(essentialPrefsForAccount(backendPrefs)).catch(() => {})
         }
@@ -229,11 +204,9 @@ export async function loadPreferences(
   }
 
   if (backendPrefs) return backendPrefs
-
-  // ── Path 3: Account prefs (partial) ────────────────────────────────────
   if (fromAccount) return fromAccount
 
-  // ── Path 4: localStorage fallback ──────────────────────────────────────
+  // Path 3: localStorage fallback
   try {
     const saved = localStorage.getItem(prefsKey(userId))
     if (saved) return JSON.parse(saved)
@@ -242,135 +215,6 @@ export async function loadPreferences(
   }
 
   return null
-}
-
-// ─── Language Progress Storage ───────────────────────────────────────────────
-
-const progressKey = (userId: string | null, lang: TargetLanguage) =>
-  `talkingo_progress_${userId || 'anon'}_${lang}`
-
-export async function saveProgress(
-  userId: string | null,
-  isAuthenticated: boolean,
-  progress: LanguageProgress
-): Promise<void> {
-  // Always save to localStorage (instant)
-  try {
-    localStorage.setItem(progressKey(userId, progress.targetLanguage), JSON.stringify(progress))
-  } catch (error) {
-    console.error('[Storage] Failed to save progress to localStorage:', error)
-  }
-  
-  // Sync to Appwrite (the one critical DB write per session)
-  if (isAuthenticated && userId) {
-    try {
-      await saveLanguageProgress(userId, progress)
-    } catch (error) {
-      console.warn('[Storage] Backend progress sync failed, queuing for retry:', error)
-      // Queue for offline sync retry
-      const { queuePendingSync } = await import('./offline-sync')
-      queuePendingSync({
-        type: 'progress',
-        userId,
-        data: progress,
-      })
-    }
-  }
-}
-
-export async function loadProgress(
-  userId: string | null,
-  isAuthenticated: boolean,
-  targetLanguage: TargetLanguage
-): Promise<LanguageProgress | null> {
-  // Try Appwrite first (authoritative)
-  if (isAuthenticated && userId) {
-    try {
-      const backend = await getLanguageProgress(userId, targetLanguage)
-      if (backend) {
-        const normalized = normalizeProgress(backend, targetLanguage)
-        try { localStorage.setItem(progressKey(userId, targetLanguage), JSON.stringify(normalized)) } catch { /* ignore */ }
-        return normalized
-      }
-    } catch (error) {
-      console.warn('[Storage] Backend progress load failed:', error)
-    }
-  }
-  // Fall back to localStorage
-  try {
-    const saved = localStorage.getItem(progressKey(userId, targetLanguage))
-    if (saved) return normalizeProgress(JSON.parse(saved), targetLanguage)
-  } catch (error) {
-    console.error('[Storage] Failed to load progress from localStorage:', error)
-  }
-  return null
-}
-
-/**
- * Backfills missing fields on stored LanguageProgress.
- */
-function normalizeProgress(p: any, targetLanguage: TargetLanguage): LanguageProgress {
-  return {
-    targetLanguage: p?.targetLanguage ?? targetLanguage,
-    cefr: p?.cefr ?? 'A1',
-    domainScores: p?.domainScores ?? {
-      vocabulary: p?.cefr ?? 'A1',
-      grammar: p?.cefr ?? 'A1',
-      fluency: p?.cefr ?? 'A1',
-      listening: p?.cefr ?? 'A1',
-    },
-    currentUnitId: p?.currentUnitId ?? 'greetings',
-    completedUnits: Array.isArray(p?.completedUnits) ? p.completedUnits : [],
-    trackedVocab: Array.isArray(p?.trackedVocab) ? p.trackedVocab : [],
-    // Handle both old string[] and new WeakPattern[] formats
-    weakPatterns: Array.isArray(p?.weakPatterns) 
-      ? p.weakPatterns.map((wp: any) => 
-          typeof wp === 'string' 
-            ? { type: 'grammar' as const, category: wp, description: wp, examples: [], frequency: 1, severity: 'low' as const, lastSeen: new Date().toISOString() }
-            : wp
-        )
-      : [],
-    totalSessions: p?.totalSessions ?? 0,
-    totalMinutes: p?.totalMinutes ?? 0,
-    streakDays: p?.streakDays ?? 0,
-    lastSessionAt: p?.lastSessionAt,
-    sessionsSinceLastAssessment: p?.sessionsSinceLastAssessment ?? 0,
-  }
-}
-
-// ─── Conversation Storage (localStorage ONLY) ───────────────────────────────
-// Transcripts are large (5-50KB) and only needed for recap generation.
-// After recap, they're compressed 96% and the raw transcript is discarded.
-// We keep last 50 in localStorage for "recent sessions" display.
-
-export async function saveConversation(
-  userId: string | null,
-  conversation: Omit<SavedConversation, 'id' | 'timestamp'>,
-  _isAuthenticated: boolean
-): Promise<SavedConversation> {
-  return saveConvLocal(conversation, userId)
-}
-
-export async function getConversations(
-  userId: string | null,
-  _isAuthenticated: boolean
-): Promise<SavedConversation[]> {
-  return getConvLocal(userId)
-}
-
-export async function deleteConversation(
-  userId: string | null,
-  conversationId: string,
-  _isAuthenticated: boolean
-): Promise<boolean> {
-  return deleteConvLocal(conversationId, userId)
-}
-
-export async function clearAllConversations(
-  userId: string | null,
-  _isAuthenticated: boolean
-): Promise<void> {
-  clearAllLocal(userId)
 }
 
 // ─── App Settings Storage (localStorage ONLY) ───────────────────────────────

@@ -1,22 +1,25 @@
 import { NextRequest, NextResponse } from 'next/server'
-import Stripe from 'stripe'
+import { stripe } from '@/lib/stripe/client'
+
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
 
 /**
  * Retrieve a Checkout Session to get customer ID after successful payment.
+ *
+ * Security: only the user who initiated the session (matched via metadata.userId)
+ * can read it back. Prevents one user from inspecting another's checkout session.
  */
-
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2025-04-30.basil' as any,
-})
 
 export async function POST(req: NextRequest) {
   try {
-    // ── Auth: verify user has a valid session ────────────────────────────
+    // ── Auth ────────────────────────────────────────────────────────────
     const { verifyAuth } = await import('@/lib/api/auth-guard')
-    const userId = await verifyAuth(req)
-    if (!userId) {
+    const auth = await verifyAuth(req)
+    if (!auth) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+    const userId = auth.userId
 
     const { sessionId } = await req.json()
     if (!sessionId) {
@@ -24,6 +27,11 @@ export async function POST(req: NextRequest) {
     }
 
     const session = await stripe.checkout.sessions.retrieve(sessionId)
+
+    // Ownership check: the session must belong to the authenticated user
+    if (session.metadata?.userId !== userId) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
 
     return NextResponse.json({
       customerId: session.customer as string,

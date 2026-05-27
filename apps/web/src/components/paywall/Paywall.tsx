@@ -1,18 +1,29 @@
 'use client'
 
 /**
- * Paywall — shown when user doesn't have an active subscription.
- * Clean, modern, premium feel. Two options: monthly or yearly.
- * $1 trial for 5 days, then auto-converts.
+ * Paywall — shown when a free user needs to convert.
+ *
+ * Three options:
+ *   - 5-Day Trial ($1 today, then $7.99/mo)
+ *   - Monthly ($7.99/mo, no trial)
+ *   - Yearly ($59.99/yr, save 37%)
+ *
+ * Yearly is preselected — best value, anchors the decision.
  */
 
 import { useState } from 'react'
 import { cn } from '@talkingo/shared/utils'
-import { Sparkles, Check, Zap, MessageCircle, Phone, Users, Crown } from 'lucide-react'
+import {
+  Sparkles, Check, Zap, MessageCircle, Phone, Users, Crown, AlertCircle,
+} from 'lucide-react'
+import { authFetch } from '@/lib/api/auth-fetch'
+import { PUBLIC_PLAN_LIST, type PlanId } from '@/lib/subscription/public-plans'
 
 interface PaywallProps {
   userEmail?: string
   userId?: string
+  /** Optional close handler — when omitted the paywall is non-dismissible */
+  onClose?: () => void
 }
 
 const FEATURES = [
@@ -24,34 +35,48 @@ const FEATURES = [
   { icon: Crown, text: 'Full session recaps & history' },
 ]
 
-export function Paywall({ userEmail, userId }: PaywallProps) {
-  const [selectedPlan, setSelectedPlan] = useState<'monthly' | 'yearly'>('monthly')
+export function Paywall({ userEmail, onClose }: PaywallProps) {
+  const [selectedPlan, setSelectedPlan] = useState<PlanId>('yearly')
   const [loading, setLoading] = useState(false)
+  const [errorMsg, setErrorMsg] = useState<string | null>(null)
 
   const handleSubscribe = async () => {
     setLoading(true)
+    setErrorMsg(null)
     try {
-      const res = await fetch('/api/stripe/checkout', {
+      const res = await authFetch('/api/stripe/checkout', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ plan: selectedPlan, email: userEmail, userId }),
+        body: JSON.stringify({ plan: selectedPlan, email: userEmail }),
       })
-      const { url, error } = await res.json()
-      if (url) {
-        window.location.href = url
-      } else {
-        console.error('[Paywall] Checkout error:', error)
-        setLoading(false)
+      const data = await res.json()
+      if (res.ok && data.url) {
+        window.location.href = data.url
+        return
       }
+      if (res.status === 409) {
+        setErrorMsg(data.message || 'You already have an active subscription.')
+      } else {
+        setErrorMsg('Could not start checkout. Please try again.')
+      }
+      setLoading(false)
     } catch (err) {
       console.error('[Paywall] Error:', err)
+      setErrorMsg('Connection issue. Check your network and try again.')
       setLoading(false)
     }
   }
 
+  const ctaLabel = (() => {
+    if (loading) return 'Redirecting...'
+    if (selectedPlan === 'trial') return 'Start trial — $1 for 5 days'
+    if (selectedPlan === 'yearly') return 'Subscribe yearly — $59.99'
+    return 'Subscribe monthly — $7.99'
+  })()
+
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-background/95 backdrop-blur-xl p-4">
-      <div className="w-full max-w-sm space-y-6 animate-fade-in">
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-background/95 backdrop-blur-xl p-4 overflow-y-auto">
+      <div className="w-full max-w-sm space-y-5 animate-fade-in py-6">
 
         {/* Header */}
         <div className="text-center space-y-2">
@@ -62,16 +87,16 @@ export function Paywall({ userEmail, userId }: PaywallProps) {
             Unlock Talkingo
           </h1>
           <p className="text-sm text-muted-foreground">
-            Start speaking fluently for just $1
+            Speak fluently. Choose what works for you.
           </p>
         </div>
 
         {/* Features */}
-        <div className="space-y-2.5 px-2">
+        <div className="space-y-2 px-1">
           {FEATURES.map(({ icon: Icon, text }) => (
             <div key={text} className="flex items-center gap-3">
-              <div className="w-8 h-8 rounded-xl bg-primary/10 flex items-center justify-center flex-shrink-0">
-                <Icon className="w-4 h-4 text-primary" />
+              <div className="w-7 h-7 rounded-xl bg-primary/10 flex items-center justify-center flex-shrink-0">
+                <Icon className="w-3.5 h-3.5 text-primary" />
               </div>
               <span className="text-sm font-medium text-foreground">{text}</span>
               <Check className="w-4 h-4 text-emerald-500 ml-auto flex-shrink-0" />
@@ -79,40 +104,70 @@ export function Paywall({ userEmail, userId }: PaywallProps) {
           ))}
         </div>
 
-        {/* Plan selector */}
-        <div className="grid grid-cols-2 gap-2.5">
-          <button
-            onClick={() => setSelectedPlan('monthly')}
-            className={cn(
-              'relative p-4 rounded-2xl border-2 transition-all text-left',
-              selectedPlan === 'monthly'
-                ? 'border-primary bg-primary/5 shadow-sm'
-                : 'border-border/40 hover:border-border/60'
-            )}
-          >
-            <p className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground mb-1">Monthly</p>
-            <p className="text-xl font-bold text-foreground">$7.99</p>
-            <p className="text-[10px] text-muted-foreground">/month</p>
-          </button>
+        {/* Plan selector — 3 stacked cards */}
+        <div className="space-y-2">
+          {PUBLIC_PLAN_LIST.map((plan) => {
+            const selected = selectedPlan === plan.id
+            return (
+              <button
+                key={plan.id}
+                onClick={() => setSelectedPlan(plan.id)}
+                className={cn(
+                  'relative w-full p-3.5 rounded-2xl border-2 transition-all text-left flex items-center gap-3',
+                  selected
+                    ? 'border-primary bg-primary/5 shadow-sm'
+                    : 'border-border/40 hover:border-border/60'
+                )}
+              >
+                {/* Radio circle */}
+                <div
+                  className={cn(
+                    'w-5 h-5 rounded-full border-2 flex-shrink-0 flex items-center justify-center transition-colors',
+                    selected ? 'border-primary' : 'border-border'
+                  )}
+                >
+                  {selected && <div className="w-2.5 h-2.5 rounded-full bg-primary" />}
+                </div>
 
-          <button
-            onClick={() => setSelectedPlan('yearly')}
-            className={cn(
-              'relative p-4 rounded-2xl border-2 transition-all text-left',
-              selectedPlan === 'yearly'
-                ? 'border-primary bg-primary/5 shadow-sm'
-                : 'border-border/40 hover:border-border/60'
-            )}
-          >
-            {/* Save badge */}
-            <span className="absolute -top-2 right-3 px-2 py-0.5 rounded-full bg-emerald-500 text-[9px] font-bold text-white uppercase">
-              Save 37%
-            </span>
-            <p className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground mb-1">Yearly</p>
-            <p className="text-xl font-bold text-foreground">$59.99</p>
-            <p className="text-[10px] text-muted-foreground">/year ($5/mo)</p>
-          </button>
+                {/* Label + pitch */}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <p className="text-sm font-bold text-foreground">{plan.label}</p>
+                    {plan.savingsLabel && (
+                      <span className="px-1.5 py-0.5 rounded-full bg-emerald-500 text-[9px] font-bold text-white uppercase">
+                        {plan.savingsLabel}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-muted-foreground leading-tight mt-0.5">
+                    {plan.pitch}
+                  </p>
+                </div>
+
+                {/* Price */}
+                <div className="text-right flex-shrink-0">
+                  <p className="text-base font-bold text-foreground leading-none">
+                    {plan.priceLabel}
+                    <span className="text-[10px] font-medium text-muted-foreground ml-0.5">
+                      {plan.periodLabel}
+                    </span>
+                  </p>
+                  {plan.subtitle && (
+                    <p className="text-[10px] text-muted-foreground mt-0.5">{plan.subtitle}</p>
+                  )}
+                </div>
+              </button>
+            )
+          })}
         </div>
+
+        {/* Error message */}
+        {errorMsg && (
+          <div className="flex items-start gap-2 px-3 py-2.5 rounded-xl bg-red-500/10 border border-red-500/20">
+            <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
+            <p className="text-xs text-red-700 dark:text-red-400">{errorMsg}</p>
+          </div>
+        )}
 
         {/* CTA */}
         <button
@@ -120,12 +175,22 @@ export function Paywall({ userEmail, userId }: PaywallProps) {
           disabled={loading}
           className="w-full py-4 rounded-2xl bg-gradient-to-r from-primary to-primary-glow text-white font-bold text-base shadow-lg shadow-primary/25 hover:shadow-xl hover:shadow-primary/30 transition-all disabled:opacity-60 disabled:cursor-not-allowed"
         >
-          {loading ? 'Redirecting...' : 'Start for $1 — 5 day trial'}
+          {ctaLabel}
         </button>
 
+        {/* Optional dismiss */}
+        {onClose && (
+          <button
+            onClick={onClose}
+            className="w-full py-2 text-xs text-muted-foreground/70 hover:text-muted-foreground transition-colors"
+          >
+            Maybe later
+          </button>
+        )}
+
         {/* Fine print */}
-        <p className="text-center text-[10px] text-muted-foreground/60 leading-relaxed px-4">
-          $1 charged today for 5-day trial. After trial, {selectedPlan === 'yearly' ? '$59.99/year' : '$7.99/month'} auto-renews. Cancel anytime from your account settings.
+        <p className="text-center text-[10px] text-muted-foreground/60 leading-relaxed px-2">
+          Cancel anytime from your profile. Subscription auto-renews. Tax may apply.
         </p>
       </div>
     </div>

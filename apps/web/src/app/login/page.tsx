@@ -8,6 +8,7 @@ import { signIn, signInWithGoogle, getSession } from '@/lib/auth/auth'
 import { useAuth } from '@/context/AuthContext'
 import { Eye, EyeOff, Loader2 } from 'lucide-react'
 import { TalkingoLogo } from '@/components/ui/TalkingoLogo'
+import { LoadingScreen } from '@/components/ui/LoadingScreen'
 
 function LoginForm() {
   const router = useRouter()
@@ -170,13 +171,7 @@ function LoginForm() {
 
 export default function LoginPage() {
   return (
-    <Suspense
-      fallback={
-        <div className="min-h-screen flex items-center justify-center bg-background">
-          <Loader2 className="w-6 h-6 text-primary animate-spin" />
-        </div>
-      }
-    >
+    <Suspense fallback={<LoadingScreen />}>
       <LoginForm />
     </Suspense>
   )

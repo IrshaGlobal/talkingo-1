@@ -2,9 +2,9 @@
 
 import { useState, useEffect } from 'react'
 import { cn } from '@talkingo/shared/utils'
-import { X, Save, Clock, MessageSquare, Trash2, CheckCircle2, Sparkles } from 'lucide-react'
-import { formatDuration } from '@/lib/utils/conversation-history'
-import type { ConversationMessage, VocabItem } from '@talkingo/shared/types'
+import { X, Clock, MessageSquare, CheckCircle2, Sparkles, PhoneOff } from 'lucide-react'
+import { formatDuration } from '@/lib/storage/chat-sessions'
+import type { VocabItem } from '@talkingo/shared/types'
 
 interface EndCallDialogProps {
   isOpen: boolean
@@ -25,18 +25,16 @@ export function EndCallDialog({
   autoSaveEnabled,
   extractedVocab = [],
 }: EndCallDialogProps) {
-  const [saveTranscript, setSaveTranscript] = useState(autoSaveEnabled)
   const [isConfirming, setIsConfirming] = useState(false)
   const [confirmedVocab, setConfirmedVocab] = useState<VocabItem[]>([])
 
   // Reset state when dialog opens
   useEffect(() => {
     if (isOpen) {
-      setSaveTranscript(autoSaveEnabled)
       setIsConfirming(false)
-      setConfirmedVocab(extractedVocab.map(v => ({ ...v }))) // Deep copy for local editing
+      setConfirmedVocab(extractedVocab.map(v => ({ ...v })))
     }
-  }, [isOpen, autoSaveEnabled, extractedVocab])
+  }, [isOpen, extractedVocab])
 
   const toggleVocabItem = (index: number) => {
     setConfirmedVocab(prev => prev.filter((_, i) => i !== index))
@@ -45,7 +43,8 @@ export function EndCallDialog({
   const handleConfirm = () => {
     setIsConfirming(true)
     setTimeout(() => {
-      onConfirm(saveTranscript, confirmedVocab)
+      // Always save (auto-save handles it), pass true for backward compat
+      onConfirm(true, confirmedVocab)
     }, 300)
   }
 
@@ -88,7 +87,7 @@ export function EndCallDialog({
             </div>
           </div>
 
-          {/* Vocab Confirmation (New Feature) */}
+          {/* Vocab Confirmation */}
           {extractedVocab.length > 0 && (
             <div className="space-y-3">
               <div className="flex items-center gap-2 text-sm font-medium text-foreground">
@@ -122,44 +121,13 @@ export function EndCallDialog({
             </div>
           )}
 
-          {/* Save transcript option */}
-          <div className="flex items-start gap-3 p-4 rounded-xl bg-primary/5 border border-primary/20">
-            <button
-              onClick={() => setSaveTranscript(!saveTranscript)}
-              className={cn(
-                'mt-0.5 w-5 h-5 rounded border-2 flex items-center justify-center transition-all duration-200 flex-shrink-0',
-                saveTranscript
-                  ? 'bg-primary border-primary'
-                  : 'bg-background border-border/60 hover:border-primary/60'
-              )}
-            >
-              {saveTranscript && <CheckCircle2 className="w-4 h-4 text-white" />}
-            </button>
-            <div className="flex-1">
-              <label 
-                onClick={() => setSaveTranscript(!saveTranscript)}
-                className="text-sm font-medium text-foreground cursor-pointer block mb-1"
-              >
-                Save Transcript
-              </label>
-              <p className="text-xs text-muted-foreground leading-relaxed">
-                {saveTranscript 
-                  ? 'This conversation will be saved to your history for future reference.'
-                  : 'This conversation will not be saved and cannot be recovered.'
-                }
-              </p>
-            </div>
+          {/* Auto-save notice */}
+          <div className="flex items-center gap-2 px-4 py-3 rounded-xl bg-primary/5 border border-primary/15">
+            <CheckCircle2 className="w-4 h-4 text-primary flex-shrink-0" />
+            <p className="text-xs text-muted-foreground">
+              Your conversation is saved automatically to history.
+            </p>
           </div>
-
-          {/* Warning if not saving */}
-          {!saveTranscript && (
-            <div className="flex items-start gap-2 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20">
-              <Trash2 className="w-4 h-4 text-amber-500 mt-0.5 flex-shrink-0" />
-              <p className="text-xs text-amber-500/90 leading-relaxed">
-                <strong>Warning:</strong> This action cannot be undone. All messages will be permanently deleted.
-              </p>
-            </div>
-          )}
         </div>
 
         {/* Actions */}
@@ -169,16 +137,14 @@ export function EndCallDialog({
             className="flex-1 px-4 py-2.5 rounded-xl bg-muted/50 text-foreground font-medium hover:bg-muted/70 transition-colors border border-border/40"
             disabled={isConfirming}
           >
-            Cancel
+            Continue Chat
           </button>
           <button
             onClick={handleConfirm}
             className={cn(
               'flex-1 px-4 py-2.5 rounded-xl font-medium transition-all duration-200 shadow-lg flex items-center justify-center gap-2',
               isConfirming ? 'opacity-70 cursor-not-allowed' : 'hover:scale-105 active:scale-95',
-              saveTranscript
-                ? 'bg-primary text-white hover:bg-primary/90 shadow-primary/20'
-                : 'bg-error text-white hover:bg-error/90 shadow-error/20'
+              'bg-primary text-white hover:bg-primary/90 shadow-primary/20'
             )}
             disabled={isConfirming}
           >
@@ -189,8 +155,8 @@ export function EndCallDialog({
               </>
             ) : (
               <>
-                {saveTranscript ? <Save className="w-4 h-4" /> : <Trash2 className="w-4 h-4" />}
-                {saveTranscript ? 'Save & End' : 'End Without Saving'}
+                <PhoneOff className="w-4 h-4" />
+                End & Review
               </>
             )}
           </button>

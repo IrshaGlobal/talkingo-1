@@ -2,6 +2,7 @@
  * Appwrite auth helpers — wraps account SDK calls with clean typed returns.
  */
 import { account } from '../api/appwrite'
+import { clearCachedJWT } from '../api/auth-fetch'
 import { ID, OAuthProvider } from 'appwrite'
 
 /**
@@ -66,6 +67,7 @@ export async function getSession(): Promise<AuthUser | null> {
 export async function signUp(email: string, password: string, name: string): Promise<AuthUser> {
   await account.create(ID.unique(), email, password, name)
   await account.createEmailPasswordSession(email, password)
+  clearCachedJWT()
   const user = await account.get()
   return {
     id: user.$id,
@@ -78,6 +80,7 @@ export async function signUp(email: string, password: string, name: string): Pro
 
 export async function signIn(email: string, password: string): Promise<AuthUser> {
   await account.createEmailPasswordSession(email, password)
+  clearCachedJWT()
   const user = await account.get()
   return {
     id: user.$id,
@@ -89,6 +92,7 @@ export async function signIn(email: string, password: string): Promise<AuthUser>
 }
 
 export async function signOut(): Promise<void> {
+  clearCachedJWT()
   await account.deleteSession('current')
 }
 

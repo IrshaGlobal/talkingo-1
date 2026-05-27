@@ -22,37 +22,24 @@ import { Paywall } from '../paywall/Paywall'
 import { SubscriptionExpired } from '../paywall/SubscriptionExpired'
 import { UpgradePrompt, type UpgradeReason } from '../paywall/UpgradePrompt'
 import { FreeUsageBadge } from '../paywall/FreeUsageBadge'
+import { TrialCountdownBadge } from '../paywall/TrialCountdownBadge'
+import { PaymentSuccessDialog } from '../paywall/PaymentSuccessDialog'
+import { CheckoutCancelledToast } from '../paywall/CheckoutCancelledToast'
+import { InfoToast } from '../paywall/InfoToast'
+import { CancellationBanner } from '../paywall/CancellationBanner'
+import { authFetch } from '@/lib/api/auth-fetch'
 import { isSubscribed, saveSubscriptionInfo, verifySubscription, needsServerVerification, syncFromAccountPrefs, isExpired, isPastDue, getSubscriptionInfo } from '@/lib/subscription/use-subscription'
 import { FREE_TIER, getDailyUsage, incrementMessageCount, getRemainingMessages, hasReachedDailyLimit, isPersonaAllowed, isModeAllowed, isLevelAllowed } from '@/lib/subscription/free-tier'
 import { LiveCallView } from './LiveCallView'
 import {
-  saveConversation as saveConvHybrid,
   loadPreferences,
   savePreferences,
-  loadProgress,
-  saveProgress,
   isOnboarded,
-  getConversations as getConvHybrid,
   loadSettings,
 } from '@/lib/storage/hybrid-storage'
 import { shouldSkipOnboarding } from '@/lib/utils/onboarding-check'
-import {
-  loadCharacterMemory,
-  saveCharacterMemory,
-  emptyCharacterMemory,
-  mergeMemoryUpdate,
-  pickFactsToReference,
-} from '@/lib/storage/character-memory'
-import { addPhrasesFromSession } from '@/lib/storage/phrase-bank'
-import { saveSessionRecap } from '@/lib/storage/session-recaps'
 import { cefrToLanguageLevel, validateCefrLevelConsistency } from '@talkingo/shared/utils'
 
-import {
-  buildUpdatedProgress,
-  getReviewWords,
-  getMasteredWords,
-  shouldReassess,
-} from '@/lib/models/learner-model'
 import {
   detectTeachingIntent,
   matchLessonTemplate,
@@ -65,8 +52,29 @@ import {
   detectUserSkip,
   detectUserStopLesson,
 } from '@/lib/models/lesson-manager'
-import { saveSessionAnalytics } from '@/lib/storage/appwrite-storage'
-import { saveChatSession } from '@/lib/storage/chat-history'
+import {
+  createSession as createChatSession,
+  updateSession as updateChatSession,
+  endSession as endChatSession,
+  recoverActiveSession,
+  type SessionMode,
+  type ChatSession,
+} from '@/lib/storage/chat-sessions'
+import {
+  loadProfile,
+  saveProfile,
+  loadProfileLocal,
+  createEmptyProfile,
+  mergeDigestIntoProfile,
+  buildDigestPrompt,
+  getNextRecommendation,
+  needsMigration,
+  migrateToProfile,
+  buildConversationState,
+  progressFromProfile,
+  type LearnerProfile,
+  type SessionDigest,
+} from '@/lib/learning'
 import type {
   ConversationMessage,
   ConversationState,
@@ -80,7 +88,6 @@ import type {
   SkillDomain,
 } from '@talkingo/shared/types'
 import { DEFAULT_DOMAIN_SCORES } from '@talkingo/shared/types'
-import type { SavedConversation } from '@/lib/utils/conversation-history'
 import { getPersonaById } from '@talkingo/shared/gemini/personas'
 import { getSeedById, pickNextSeed, getStartingSeedForLevel } from '@talkingo/shared/curriculum'
 import { useAuth } from '@/context/AuthContext'
@@ -130,9 +137,6 @@ export function ConversationPage() {
     targetLanguage: 'en',
   })
   const [preferences, setPreferences] = useState<UserPreferences | null>(null)
-  const [progress, setProgress] = useState<LanguageProgress | null>(null)
-  // Domain score accumulators (not persisted — reset each app load, that's fine)
-  const [domainAccumulators, setDomainAccumulators] = useState<Partial<Record<SkillDomain, number>>>({})
   const [conversationMode, setConversationMode] = useState<'manual' | 'handsfree' | 'callonly' | 'live'>('manual')
 
   // Gated mode change — free users can only use 'manual' (chat)
@@ -149,6 +153,13 @@ export function ConversationPage() {
   const [serviceError, setServiceError] = useState<ServiceErrorType | null>(null)
   const [showEndCallDialog, setShowEndCallDialog] = useState(false)
   const [callDuration, setCallDuration] = useState(0)
+
+  // ── Auto-save session tracking ──────────────────────────────────────────
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
+  const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // ── Learning system (new unified profile) ─────────────────────────────
+  const [learnerProfile, setLearnerProfile] = useState<LearnerProfile | null>(null)
 
   // Session-only collected data for recap
   const [sessionCorrections, setSessionCorrections] = useState<Correction[]>([])
@@ -181,6 +192,15 @@ export function ConversationPage() {
   const [upgradeReason, setUpgradeReason] = useState<UpgradeReason | null>(null)
   const [remainingMessages, setRemainingMessages] = useState<number>(FREE_TIER.DAILY_MESSAGES)
 
+  // Post-payment flow
+  const [showPaymentSuccess, setShowPaymentSuccess] = useState(false)
+  const [paymentSuccessInfo, setPaymentSuccessInfo] = useState<{
+    trialEndsAt?: number
+    plan?: 'monthly' | 'yearly'
+  } | null>(null)
+  const [showCheckoutCancelledToast, setShowCheckoutCancelledToast] = useState(false)
+  const [showBillingUpdatedToast, setShowBillingUpdatedToast] = useState(false)
+
   // Sync subscription state once user is loaded
   useEffect(() => {
     if (!user?.id) return
@@ -188,41 +208,116 @@ export function ConversationPage() {
     setRemainingMessages(getRemainingMessages(user.id))
   }, [user?.id])
 
-  // Check for successful payment return from Stripe
+  // Handle Stripe redirect outcomes (success / cancelled / billing-updated)
   useEffect(() => {
     if (typeof window === 'undefined') return
+    if (!user?.id) return
+
     const params = new URLSearchParams(window.location.search)
+    const userId = user.id
+
+    // Successful checkout return — authoritative sync via Stripe
     if (params.get('subscription') === 'success') {
-      // Payment completed — mark as subscribed immediately
-      saveSubscriptionInfo({ status: 'trialing', plan: 'monthly' }, user?.id)
+      const sessionId = params.get('session_id')
+      // Optimistically mark as subscribed so UI flips immediately
+      saveSubscriptionInfo({ status: 'trialing', plan: 'monthly' }, userId)
       setIsSubscribedCheck(true)
       setShowedPaywall(true)
 
-      // Fetch session to get customer ID (for "Manage" button)
-      const sessionId = params.get('session_id')
-      if (sessionId) {
-        fetch('/api/stripe/session', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionId }),
-        }).then(r => r.json()).then(data => {
-          if (data.customerId) {
-            saveSubscriptionInfo({
-              status: 'trialing',
-              plan: data.plan || 'monthly',
-              customerId: data.customerId,
-            }, user?.id)
+      // Authoritative: pull from Stripe → write to Appwrite → use the result
+      // here. This is what fixes "payment went through but app doesn't see it"
+      // when the webhook hasn't fired yet (or won't fire in local dev).
+      const syncCheckoutAndShowSuccess = async () => {
+        if (sessionId) {
+          try {
+            const res = await authFetch('/api/stripe/sync-checkout', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sessionId }),
+            })
+            if (res.ok) {
+              const data = await res.json()
+              saveSubscriptionInfo({
+                status: data.status,
+                plan: data.plan,
+                customerId: data.customerId,
+                trialEndsAt: data.trialEnd,
+                currentPeriodEnd: data.periodEnd,
+                cancelAtPeriodEnd: data.cancelAtPeriodEnd,
+              }, userId)
+              setIsSubscribedCheck(data.status === 'active' || data.status === 'trialing')
+              setPaymentSuccessInfo({
+                trialEndsAt: data.trialEnd,
+                plan: data.plan,
+              })
+              setShowPaymentSuccess(true)
+              return
+            }
+            // 202 = subscription not yet ready (rare); poll a couple of times
+            if (res.status === 202) {
+              for (let i = 0; i < 3; i++) {
+                await new Promise(r => setTimeout(r, 1500))
+                const retry = await authFetch('/api/stripe/sync-checkout', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ sessionId }),
+                })
+                if (retry.ok) {
+                  const data = await retry.json()
+                  saveSubscriptionInfo({
+                    status: data.status,
+                    plan: data.plan,
+                    customerId: data.customerId,
+                    trialEndsAt: data.trialEnd,
+                    currentPeriodEnd: data.periodEnd,
+                    cancelAtPeriodEnd: data.cancelAtPeriodEnd,
+                  }, userId)
+                  setIsSubscribedCheck(data.status === 'active' || data.status === 'trialing')
+                  setPaymentSuccessInfo({
+                    trialEndsAt: data.trialEnd,
+                    plan: data.plan,
+                  })
+                  setShowPaymentSuccess(true)
+                  return
+                }
+              }
+            }
+          } catch (err) {
+            console.warn('[Payment] sync-checkout failed:', err)
           }
-        }).catch((err) => {
-          // Non-critical: subscription is already active, just missing customerId for portal
-          console.warn('[Payment] Could not fetch session details:', err)
-        })
+        }
+        // Fallback: use whatever the status route says
+        try {
+          const info = await verifySubscription(userId)
+          setPaymentSuccessInfo({ trialEndsAt: info.trialEndsAt, plan: info.plan })
+        } catch {
+          setPaymentSuccessInfo({ plan: 'monthly' })
+        }
+        setShowPaymentSuccess(true)
       }
+      syncCheckoutAndShowSuccess()
+    }
 
-      // Clean URL (preserve non-subscription params like UTM)
+    // User backed out of Stripe checkout
+    if (params.get('subscription') === 'cancelled') {
+      setShowCheckoutCancelledToast(true)
+    }
+
+    // User came back from the customer portal — refresh state
+    if (params.get('billing') === 'updated') {
+      setShowBillingUpdatedToast(true)
+      verifySubscription(userId).then(info => {
+        const active = info.status === 'active' || info.status === 'trialing'
+        setIsSubscribedCheck(active)
+      }).catch(() => { /* ignore */ })
+    }
+
+    // Clean URL (preserve unrelated params like UTM)
+    if (params.has('subscription') || params.has('session_id') || params.has('billing')) {
       const url = new URL(window.location.href)
       url.searchParams.delete('subscription')
       url.searchParams.delete('session_id')
+      url.searchParams.delete('billing')
       window.history.replaceState({}, '', url.pathname + url.search)
     }
   }, [user?.id])
@@ -370,10 +465,54 @@ export function ConversationPage() {
         stateRef.current = newState
         geminiClient.setLanguage(prefs.targetLanguage)
 
-        // Load progress for this language (best-effort)
+        // Load learner profile for this language (the new unified system)
         if (prefs.targetLanguage) {
-          const p = await loadProgress(user?.id ?? null, !!user, prefs.targetLanguage)
-          if (!cancelled) setProgress(p)
+          try {
+            let profile = await loadProfile(user?.id ?? null, !!user, prefs.targetLanguage)
+
+            // Migrate from old data if needed
+            if (!profile && needsMigration(user?.id ?? null, prefs.targetLanguage)) {
+              const oldProgressRaw = localStorage.getItem(`talkingo_progress_${user?.id || 'anon'}_${prefs.targetLanguage}`)
+              const oldProgress = oldProgressRaw ? JSON.parse(oldProgressRaw) : null
+              const oldMemoryRaw = localStorage.getItem(`talkingo_memory_${prefs.persona || 'eli'}_${prefs.targetLanguage}`)
+              const oldMemory = oldMemoryRaw ? JSON.parse(oldMemoryRaw) : null
+              const allConvMemories = JSON.parse(localStorage.getItem('talkingo_conversation_memory') || '{}')
+              const convMemKey = `${user?.id}_${prefs.persona || 'eli'}_${prefs.targetLanguage}`
+              const oldConvMemory = allConvMemories[convMemKey] || null
+
+              profile = migrateToProfile(
+                user?.id ?? 'anon',
+                prefs.targetLanguage,
+                prefs.nativeLanguage || 'en',
+                (prefs.persona || 'eli') as PersonaId,
+                prefs.userName || user?.name,
+                oldProgress,
+                oldMemory,
+                oldConvMemory
+              )
+              if (profile) {
+                await saveProfile(user?.id ?? null, !!user, profile)
+                console.log('[Learning] Migrated to new LearnerProfile')
+              }
+            }
+
+            // Create empty profile if still none (new user)
+            if (!profile) {
+              profile = createEmptyProfile(
+                user?.id ?? 'anon',
+                prefs.targetLanguage,
+                prefs.nativeLanguage || 'en',
+                (prefs.persona || 'eli') as PersonaId,
+                1,
+                prefs.userName || user?.name
+              )
+              await saveProfile(user?.id ?? null, !!user, profile)
+            }
+
+            if (!cancelled) setLearnerProfile(profile)
+          } catch (e) {
+            console.warn('[Learning] Profile load failed:', e)
+          }
         }
         setView('home')
 
@@ -406,6 +545,55 @@ export function ConversationPage() {
       transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight
     }
   }, [messages, interimTranscript])
+
+  // ── Auto-save: persist messages to chat-sessions on every change (debounced) ──
+  useEffect(() => {
+    if (!activeSessionId) return
+    if (messages.length === 0) return
+
+    // Debounce: wait 500ms after last message change before writing
+    if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current)
+    autoSaveTimerRef.current = setTimeout(() => {
+      updateChatSession(
+        user?.id ?? null,
+        activeSessionId,
+        messages,
+        conversationModeRef.current as SessionMode,
+        callDuration
+      )
+    }, 500)
+
+    return () => {
+      if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current)
+    }
+  }, [messages, activeSessionId, callDuration, user?.id])
+
+  // ── Recover interrupted session on mount ──────────────────────────────────
+  useEffect(() => {
+    if (authLoading) return
+    const recovered = recoverActiveSession(user?.id ?? null)
+    if (recovered && recovered.messages.length > 0) {
+      console.log('[AutoSave] Recovered interrupted session:', recovered.id, 'with', recovered.messages.length, 'messages')
+    }
+  }, [user?.id, authLoading])
+
+  // ── Flush session on page unload (tab close, refresh, navigate away) ─────
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      if (activeSessionId && messages.length > 0) {
+        // Synchronous flush — no debounce
+        updateChatSession(
+          user?.id ?? null,
+          activeSessionId,
+          messages,
+          conversationModeRef.current as SessionMode,
+          callDuration
+        )
+      }
+    }
+    window.addEventListener('beforeunload', handleBeforeUnload)
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload)
+  }, [activeSessionId, messages, callDuration, user?.id])
 
   // ── Mic control (voice recording → send audio directly to Gemini) ────────
   const recorderRef = useRef<AudioRecorder | null>(null)
@@ -924,21 +1112,13 @@ export function ConversationPage() {
           completeLesson(userId, lang, activeLessonPath.lessonId)
           setConversationState((prev) => ({ ...prev, lessonPath: null }))
           stateRef.current = { ...stateRef.current, lessonPath: null }
-          // Add to completedLessons in progress
-          if (progress) {
-            const updatedProgress = {
-              ...progress,
-              completedLessons: [...(progress.completedLessons ?? []), activeLessonPath.lessonId],
-            }
-            setProgress(updatedProgress)
-          }
         }
       }
 
       // Unit-complete signal — bump to next seed using smart picker
       if (result.unitComplete && !stateRef.current.lessonPath) {
         const domainScores = stateRef.current.domainScores ?? { vocabulary: 'A1', grammar: 'A1', fluency: 'A1', listening: 'A1' }
-        const completedIds = progress?.completedUnits ?? []
+        const completedIds: string[] = []
         const nextSeed = pickNextSeed(domainScores as any, completedIds, stateRef.current.currentUnitId)
         if (nextSeed && nextSeed.id !== stateRef.current.currentUnitId) {
           setConversationState((prev) => ({ ...prev, currentUnitId: nextSeed.id }))
@@ -971,7 +1151,7 @@ export function ConversationPage() {
       setServiceError(errorType)
       pendingRetryRef.current = () => handleUserInputRef.current(userText)
     }
-  }, [speakAndResume, requestAudioForMessage, progress, user])
+  }, [speakAndResume, requestAudioForMessage, user])
 
   const handleUserInputRef = useRef(handleUserInput)
   useEffect(() => { handleUserInputRef.current = handleUserInput }, [handleUserInput])
@@ -1010,8 +1190,20 @@ export function ConversationPage() {
     setForceWelcome(false)
 
     if (completed.targetLanguage) {
-      const p = await loadProgress(user?.id ?? null, !!user, completed.targetLanguage)
-      setProgress(p)
+      // Load or create LearnerProfile for the new language
+      let profile = await loadProfile(user?.id ?? null, !!user, completed.targetLanguage)
+      if (!profile) {
+        profile = createEmptyProfile(
+          user?.id ?? 'anon',
+          completed.targetLanguage,
+          completed.nativeLanguage || 'en',
+          (completed.persona || 'eli') as PersonaId,
+          1,
+          completed.userName || user?.name
+        )
+        await saveProfile(user?.id ?? null, !!user, profile)
+      }
+      setLearnerProfile(profile)
     }
 
     const newState = stateFromPrefs(completed, user?.name)
@@ -1039,7 +1231,6 @@ export function ConversationPage() {
           const customData = JSON.parse(stored)
           if (customData.id === scenarioId) {
             customScenarioPrompt = customData.prompt
-            // Clean up session storage
             sessionStorage.removeItem('talkingo_custom_scenario')
           }
         }
@@ -1048,69 +1239,40 @@ export function ConversationPage() {
       }
     }
 
-    const domainScores = progress?.domainScores ?? preferences.domainScores ?? DEFAULT_DOMAIN_SCORES
-    const reviewWords = progress ? getReviewWords(progress.trackedVocab, progress.totalSessions) : []
-    const masteredWords = progress ? getMasteredWords(progress.trackedVocab) : []
+    // Ensure we have a profile (load or create)
+    let profile = learnerProfile
+    if (!profile) {
+      profile = await loadProfile(user?.id ?? null, !!user, preferences.targetLanguage ?? 'en')
+      if (!profile) {
+        profile = createEmptyProfile(
+          user?.id ?? 'anon',
+          preferences.targetLanguage ?? 'en',
+          preferences.nativeLanguage || 'en',
+          (preferences.persona || 'eli') as PersonaId,
+          1,
+          preferences.userName || user?.name
+        )
+        await saveProfile(user?.id ?? null, !!user, profile)
+      }
+      setLearnerProfile(profile)
+    }
 
-    // Pick a planted phrase for ambient injection (Feature 2)
+    // Pick a planted phrase for ambient injection
     const seed = scenarioId !== 'free-talk' && !scenarioId.startsWith('custom-') ? getSeedById(scenarioId) : null
-    const planted = pickPlantedPhrase(seed?.targetVocab ?? [], progress?.cefr ?? preferences.cefr)
+    const planted = pickPlantedPhrase(seed?.targetVocab ?? [], preferences.cefr)
     sessionPlantedPhraseRef.current = planted
 
-    // Load character memory for the chosen persona × language (Feature 4)
-    const personaId = preferences.persona ?? 'eli'
-    const targetLang = preferences.targetLanguage ?? 'en'
-    let memory = null
-    try {
-      // For 'continue' mode, load from conversation-memory (localStorage)
-      if (mode === 'continue' && user?.id) {
-        const { loadMemory } = await import('@/lib/storage/conversation-memory')
-        const convMemory = loadMemory(user.id, personaId, targetLang)
-        if (convMemory) {
-          memory = {
-            userId: user.id,
-            personaId,
-            targetLanguage: targetLang,
-            summary: convMemory.conversationSummary,
-            lastTopics: convMemory.lastTopics,
-            facts: convMemory.userFacts.map(fact => ({ fact, sessionNumber: convMemory.totalSessions })),
-            sessionsCount: convMemory.totalSessions,
-            lastSessionAt: convMemory.lastSessionAt,
-          }
-        }
-      }
-      
-      // Fallback to character-memory (Appwrite/hybrid) if no localStorage memory
-      if (!memory) {
-        memory = await loadCharacterMemory(user?.id ?? null, !!user, personaId, targetLang)
-      }
-    } catch (e) {
-      console.warn('[startSession] character memory load failed:', e)
-    }
+    // Resume lesson path if this is a lesson session
+    const lessonPath = scenarioId.startsWith('lesson-')
+      ? resumeLesson(user?.id ?? 'anon', preferences.targetLanguage ?? 'en', scenarioId.replace('lesson-', ''), preferences.cefr)
+      : null
 
-    const newState: ConversationState = {
-      ...stateFromPrefs(preferences, user?.name),
-      currentUnitId: scenarioId,
-      // For custom scenarios, use the prompt as the topic
-      topic: customScenarioPrompt || preferences.topic,
-      domainScores,
-      masteredWords,
-      reviewWords,
-      weakPatterns: progress?.weakPatterns?.map(p => typeof p === 'string' ? p : (p as any).description || (p as any).category || ''),
-      sessionNumber: (progress?.totalSessions ?? 0) + 1,
+    // Build ConversationState from the unified profile
+    const newState = buildConversationState(profile, scenarioId, {
+      customScenarioPrompt: customScenarioPrompt ?? undefined,
       plantedPhrase: planted,
-      characterMemory: memory && memory.summary
-        ? {
-            summary: memory.summary,
-            lastTopics: memory.lastTopics,
-            factsToReference: pickFactsToReference(memory, 3),
-          }
-        : null,
-      // Resume lesson path if this is a lesson session
-      lessonPath: scenarioId.startsWith('lesson-')
-        ? resumeLesson(user?.id ?? 'anon', preferences.targetLanguage ?? 'en', scenarioId.replace('lesson-', ''), progress?.cefr ?? preferences.cefr)
-        : null,
-    }
+      lessonPath,
+    })
     setConversationState(newState)
     stateRef.current = newState
     geminiClient.setLanguage(newState.targetLanguage)
@@ -1123,6 +1285,25 @@ export function ConversationPage() {
     setInterimTranscript('')
     setIsProcessing(true)
     setView('in-call')
+
+    // ── Create auto-save session ──────────────────────────────────────────
+    const sessionSeed = scenarioId !== 'free-talk' && !scenarioId.startsWith('custom-')
+      ? getSeedById(scenarioId) : null
+    const lessonTitle = newState.lessonPath?.title
+    const sessionTitle = lessonTitle
+      ? `Lesson: ${lessonTitle}`
+      : customScenarioPrompt
+        ? 'Custom Scenario'
+        : sessionSeed?.title ?? 'Free Talk'
+    const newSessionId = createChatSession(user?.id ?? null, {
+      mode: conversationMode as SessionMode,
+      personaId: (preferences.persona ?? 'eli') as PersonaId,
+      targetLanguage: preferences.targetLanguage ?? 'en',
+      title: sessionTitle,
+      level: preferences.cefr ?? preferences.level ?? 'B1',
+      scenarioId,
+    })
+    setActiveSessionId(newSessionId)
 
     try {
       // Use pre-fetched warmup opener if available (for free-talk sessions)
@@ -1165,7 +1346,7 @@ export function ConversationPage() {
       setServiceError(errorType)
       pendingRetryRef.current = () => startSession(scenarioId, mode)
     }
-  }, [preferences, progress, user, speakAndResume, requestAudioForMessage])
+  }, [preferences, learnerProfile, user, speakAndResume, requestAudioForMessage])
 
   // ── Persona change from settings ─────────────────────────────────────────
   const handlePersonaChange = useCallback((personaId: PersonaId) => {
@@ -1223,33 +1404,32 @@ export function ConversationPage() {
       }
       updatedPrefs.cefr = newCefr
       
-      // Reset domain accumulators since the baseline has changed
-      setDomainAccumulators({})
-      
       // Reset current unit to appropriate starting point for new level
       const startingSeed = getStartingSeedForLevel(updatedPrefs.level)
       updatedPrefs.currentUnitId = startingSeed.id
-      
-      console.log('[handleLearningPrefsChange] Level changed, resetting accumulators and unit:', {
+
+      console.log('[handleLearningPrefsChange] Level changed, resetting unit:', {
         oldCefr: preferences.cefr,
         newCefr: newCefr,
         newUnitId: startingSeed.id,
       })
-      
-      // IMPORTANT: Also update progress to reflect the user's manual level choice
-      // This ensures HomeScreen displays the correct level (it prioritizes progress.cefr)
-      if (progress) {
-        const updatedProgress = {
-          ...progress,
-          cefr: newCefr,
-          domainScores: updatedPrefs.domainScores,
+
+      // Update LearnerProfile to reflect new level
+      if (learnerProfile) {
+        const newLevel = newCefr === 'A1' ? 1 : newCefr === 'A2' ? 3 : newCefr === 'B1' ? 5
+          : newCefr === 'B2' ? 7 : newCefr === 'C1' ? 9 : 11
+        const updatedProfile = {
+          ...learnerProfile,
+          level: newLevel,
+          sessionsAtLevel: 0,
+          levelUpSignals: 0,
+          levelDownSignals: 0,
+          updatedAt: Date.now(),
         }
-        setProgress(updatedProgress)
-        // Save updated progress to backend
-        saveProgress(user?.id ?? null, !!user, updatedProgress).catch(e => {
-          console.warn('[handleLearningPrefsChange] Failed to save progress:', e)
+        setLearnerProfile(updatedProfile)
+        saveProfile(user?.id ?? null, !!user, updatedProfile).catch((e: unknown) => {
+          console.warn('[handleLearningPrefsChange] Failed to save profile:', e)
         })
-        console.log('[handleLearningPrefsChange] Updated progress with new CEFR:', newCefr)
       }
     }
     
@@ -1264,16 +1444,15 @@ export function ConversationPage() {
     setConversationState(newState)
     stateRef.current = newState
 
-    // If target language changed, update the gemini client and reload progress
+    // If target language changed, update the gemini client and reload profile
     if (changes.targetLanguage && changes.targetLanguage !== preferences.targetLanguage) {
       geminiClient.setLanguage(changes.targetLanguage as any)
-      // Load progress for the new language
       ;(async () => {
-        const p = await loadProgress(user?.id ?? null, !!user, changes.targetLanguage as any)
-        setProgress(p)
+        const p = await loadProfile(user?.id ?? null, !!user, changes.targetLanguage as any)
+        setLearnerProfile(p)
       })()
     }
-  }, [preferences, user, progress])
+  }, [preferences, user, learnerProfile])
 
   // ── Re-assess level (triggers onboarding conversation) ───────────────────
   const handleReassess = useCallback(() => {
@@ -1321,7 +1500,7 @@ export function ConversationPage() {
 
   const handleEndCallRequest = useCallback(() => setShowEndCallDialog(true), [])
 
-  // ── End call → save + recap → home ───────────────────────────────────────
+  // ── End call → recap → home ────────────────────────────────────────────
   const handleEndCallConfirm = useCallback(async (saveTranscript: boolean, confirmedVocab?: VocabItem[]) => {
     setShowEndCallDialog(false)
 
@@ -1340,28 +1519,18 @@ export function ConversationPage() {
     // Use confirmed vocab if provided, otherwise fall back to sessionVocab
     const finalVocab = confirmedVocab || sessionVocab
 
-    if (saveTranscript && wasMessageCount > 0) {
-      try {
-        // Strip voice-note audio blobs before persisting (way too big)
-        const messagesForSave = messages.map((m) => {
-          if (!m.audio) return m
-          const { audio: _audio, ...rest } = m
-          return rest
-        })
-        await saveConvHybrid(
-          user?.id ?? null,
-          {
-            messages: messagesForSave,
-            duration: fullDuration,
-            state: conversationState,
-            topic: conversationState.topic,
-            level: conversationState.level,
-          },
-          !!user
-        )
-      } catch (e) {
-        console.warn('[end-call] save failed:', e)
-      }
+    // ── End the auto-save session (mark as ended) ─────────────────────────
+    if (activeSessionId) {
+      // Final flush: save latest messages before marking ended
+      updateChatSession(
+        user?.id ?? null,
+        activeSessionId,
+        messages,
+        conversationModeRef.current as SessionMode,
+        fullDuration
+      )
+      endChatSession(user?.id ?? null, activeSessionId, fullDuration)
+      setActiveSessionId(null)
     }
 
     // Reset call-only state but keep progress and preferences
@@ -1371,42 +1540,6 @@ export function ConversationPage() {
     setServiceError(null)
     isProcessingRef.current = false
     pendingRetryRef.current = null
-
-    // Auto-collect phrase bank entries from the just-finished session (Feature 7)
-    if (wasMessageCount > 0) {
-      try {
-        await addPhrasesFromSession(
-          user?.id ?? null,
-          !!user,
-          (conversationState.targetLanguage ?? 'en') as TargetLanguage,
-          messages,
-          conversationState.persona ?? 'eli',
-          conversationState.currentUnitId ?? 'greetings'
-        )
-      } catch (e) {
-        console.warn('[phrase-bank] collect failed:', e)
-      }
-
-      // Save to local chat history (System 12)
-      try {
-        const unit = getSeedById(conversationState.currentUnitId ?? '')
-        const lessonTitle = conversationState.lessonPath?.title
-        const title = lessonTitle
-          ? `Lesson: ${lessonTitle}`
-          : unit?.title ?? 'Free Talk'
-        saveChatSession({
-          sessionId: `${Date.now()}`,
-          date: new Date().toISOString(),
-          title,
-          personaId: (conversationState.persona ?? 'eli') as PersonaId,
-          targetLanguage: conversationState.targetLanguage ?? 'en',
-          messages,
-          durationSeconds: fullDuration,
-        })
-      } catch (e) {
-        console.warn('[chat-history] save failed:', e)
-      }
-    }
 
     // ── Generate recap (best-effort) ──
     if (wasMessageCount >= 2) {
@@ -1431,21 +1564,12 @@ export function ConversationPage() {
         })
         setRecap(r)
 
-        // Save recap to localStorage (last 10 for history display)
-        saveSessionRecap(
-          user?.id ?? null,
-          r,
-          (conversationState.targetLanguage ?? 'en') as TargetLanguage,
-          conversationState.persona
-        )
-
-        // Update progress
-        await updateProgressAfterSession(r, finalVocab)
-
-        // Update character memory in the background (non-blocking)
-        updateCharacterMemoryAfterSession(transcriptForRecap).catch((e) => {
-          console.warn('[memory-update] failed:', e)
-        })
+        // Update LearnerProfile via session digest (the new unified update)
+        if (learnerProfile) {
+          updateLearnerProfileAfterSession(transcriptForRecap, fullDuration).catch((e) => {
+            console.warn('[learner-profile] digest failed:', e)
+          })
+        }
       } catch (err) {
         console.warn('[recap] failed:', err)
         setRecap({
@@ -1459,7 +1583,6 @@ export function ConversationPage() {
           unitComplete: false,
           nextFocus: 'Try a few more turns next time.',
         })
-        await updateProgressAfterSession(null, sessionVocab)
       } finally {
         setRecapLoading(false)
       }
@@ -1471,106 +1594,63 @@ export function ConversationPage() {
       geminiClient.resetHistory()
       setView('home')
     }
-  }, [messages, callDuration, conversationState, sessionCorrections, sessionVocab, user, stopMic])
+  }, [messages, callDuration, conversationState, sessionCorrections, sessionVocab, user, stopMic, activeSessionId])
 
 
 
   /**
-   * Update the rolling character memory for the current persona × language.
+   * Update the LearnerProfile using a session digest from the AI.
    * Runs in the background after a session — never blocks the recap.
+   * This is the ONE post-session update — replaces character memory + progress + analytics.
    */
-  const updateCharacterMemoryAfterSession = async (
-    transcript: Array<{ role: 'user' | 'ai'; text: string }>
+  const updateLearnerProfileAfterSession = async (
+    transcript: Array<{ role: 'user' | 'ai'; text: string }>,
+    durationSeconds: number
   ) => {
-    if (transcript.length < 4) return // not enough signal
-    const personaId = conversationState.persona ?? 'eli'
-    const targetLang = (conversationState.targetLanguage ?? 'en') as TargetLanguage
-    const userId = user?.id ?? 'anon'
+    if (!learnerProfile) return
+    if (transcript.length < 2) return // need at least 1 exchange
 
-    const existing = (await loadCharacterMemory(user?.id ?? null, !!user, personaId, targetLang))
-      ?? emptyCharacterMemory(userId, personaId, targetLang)
+    const durationMinutes = Math.max(1, Math.round(durationSeconds / 60))
+    const vocabIntroduced = sessionVocab.map(v => ({ term: v.term, gloss: v.gloss }))
+    const corrections = sessionCorrections.map(c => ({
+      original: c.original,
+      corrected: c.corrected,
+      type: c.type,
+      note: c.note,
+    }))
 
     try {
-      const update = await geminiClient.updateCharacterMemory({
-        personaId,
-        previousSummary: existing.summary,
-        knownFacts: existing.facts.map((f) => f.fact),
+      const prompt = buildDigestPrompt(
+        learnerProfile,
         transcript,
-      })
-      const merged = mergeMemoryUpdate(existing, update, existing.sessionsCount + 1)
-      await saveCharacterMemory(user?.id ?? null, !!user, merged)
-      
-      // Also save to conversation-memory (localStorage) for quick access on home screen
-      if (user?.id) {
-        const { saveMemory } = await import('@/lib/storage/conversation-memory')
-        saveMemory({
-          userId: user.id,
-          personaId,
-          targetLanguage: targetLang,
-          lastScenarioId: conversationState.currentUnitId,
-          lastTopics: update.lastTopics,
-          userFacts: update.newFacts,
-          conversationSummary: update.summary,
-          lastSessionAt: Date.now(),
-          totalSessions: (progress?.totalSessions ?? 0) + 1,
-        })
+        corrections,
+        vocabIntroduced,
+        durationMinutes
+      )
+
+      const digest: SessionDigest = await geminiClient.generateSessionDigest({ digestPrompt: prompt })
+
+      if (typeof digest.levelSignal !== 'number') return
+
+      const scenarioId = conversationState.currentUnitId ?? 'free-talk'
+      const updatedProfile = mergeDigestIntoProfile(learnerProfile, digest, durationMinutes, scenarioId)
+
+      setLearnerProfile(updatedProfile)
+      await saveProfile(user?.id ?? null, !!user, updatedProfile)
+
+      // Persist current unit on prefs (so next session starts from the right place)
+      if (preferences && updatedProfile.lastSession?.scenarioId) {
+        const updatedPrefs: UserPreferences = {
+          ...preferences,
+          currentUnitId: updatedProfile.lastSession.scenarioId,
+        }
+        setPreferences(updatedPrefs)
+        try { await savePreferences(user?.id ?? null, updatedPrefs, !!user) } catch { /* ignore */ }
       }
+
+      console.log('[Learning] Profile updated. Level:', updatedProfile.level, 'Struggles:', updatedProfile.struggles.length, 'Active words:', updatedProfile.activeWords.length)
     } catch (e) {
-      console.warn('[character-memory] update failed:', e)
-    }
-  }
-
-  /** Updates LanguageProgress based on the just-finished session. */
-  const updateProgressAfterSession = async (sessionRecap: SessionRecap | null, vocabToUse?: VocabItem[]) => {
-    const targetLanguage = (conversationState.targetLanguage ?? 'en') as TargetLanguage
-    const seedId = conversationState.currentUnitId ?? 'greetings'
-
-    const { progress: newProgress, newAccumulators, analytics } = buildUpdatedProgress(
-      progress,
-      {
-        recap: sessionRecap,
-        vocabSeen: vocabToUse || sessionVocab,
-        corrections: sessionCorrections,
-        durationSeconds: callDuration,
-        targetLanguage,
-        seedId,
-        userId: user?.id ?? 'anonymous',
-        messageCount: messages.length,
-      },
-      domainAccumulators
-    )
-
-    setProgress(newProgress)
-    setDomainAccumulators(newAccumulators)
-
-    try {
-      await saveProgress(user?.id ?? null, !!user, newProgress)
-    } catch (e) {
-      console.warn('[progress] save failed:', e)
-    }
-
-    // Log analytics (non-blocking)
-    if (user?.id) {
-      saveSessionAnalytics(analytics).catch(() => {})
-    }
-
-    // Persist current unit + domain scores on prefs
-    if (preferences) {
-      const updatedPrefs: UserPreferences = {
-        ...preferences,
-        currentUnitId: newProgress.currentUnitId,
-        cefr: newProgress.cefr,
-        domainScores: newProgress.domainScores,
-      }
-      setPreferences(updatedPrefs)
-      try { await savePreferences(user?.id ?? null, updatedPrefs, !!user) } catch { /* ignore */ }
-    }
-
-    // Check if re-assessment is due
-    if (shouldReassess(newProgress) && preferences?.targetLanguage) {
-      console.log('[LearnerModel] Re-assessment due after', newProgress.sessionsSinceLastAssessment, 'sessions')
-      // Reset counter — actual re-assessment happens next time user opens the app
-      // (we don't interrupt the recap flow)
+      console.warn('[learner-profile] digest generation/merge failed:', e)
     }
   }
 
@@ -1588,20 +1668,18 @@ export function ConversationPage() {
 
   const handleEndCallCancel = useCallback(() => setShowEndCallDialog(false), [])
 
-  const handleLoadConversation = useCallback((savedConv: SavedConversation) => {
+  const handleLoadConversation = useCallback((savedConv: ChatSession) => {
     // Force manual mode for free users loading a conversation
     if (!isSubscribed(user?.id) && !isModeAllowed(conversationModeRef.current)) {
       setConversationMode('manual')
     }
 
     setMessages(savedConv.messages)
-    setConversationState(savedConv.state)
-    stateRef.current = savedConv.state
-    geminiClient.setLanguage(savedConv.state.targetLanguage)
+    geminiClient.setLanguage(conversationState.targetLanguage)
     geminiClient.resetHistory()
     setCallDuration(0)
     setView('in-call')
-    const lastAi = savedConv.messages.filter((m) => !m.isUser).pop()
+    const lastAi = savedConv.messages.filter((m: ConversationMessage) => !m.isUser).pop()
     if (!lastAi) return
     if (conversationModeRef.current === 'manual' || conversationModeRef.current === 'handsfree') {
       const persona = getPersonaById(stateRef.current.persona || 'eli')
@@ -1609,7 +1687,7 @@ export function ConversationPage() {
     } else {
       speakAndResume(lastAi.text)
     }
-  }, [speakAndResume, requestAudioForMessage])
+  }, [speakAndResume, requestAudioForMessage, conversationState.targetLanguage])
 
   const handleErrorRetry = useCallback(() => {
     setServiceError(null)
@@ -1716,6 +1794,9 @@ export function ConversationPage() {
       // Free users can enter the app — no hard paywall
     }
 
+    // Derive legacy LanguageProgress from the unified LearnerProfile
+    const progress = progressFromProfile(learnerProfile)
+
     return (
       <>
         <HomeShell
@@ -1797,7 +1878,7 @@ export function ConversationPage() {
           onInteractionModeChange={handleModeChange}
           currentPersona={conversationState.persona}
           onPersonaChange={handlePersonaChange}
-          domainScores={progress?.domainScores ?? preferences?.domainScores}
+          domainScores={progressFromProfile(learnerProfile)?.domainScores ?? preferences?.domainScores}
           callDuration={callDuration}
           onEndCall={handleEndCallRequest}
           autoPlayVoiceNotes={autoPlayMode}
@@ -1819,6 +1900,55 @@ export function ConversationPage() {
             onClick={() => setUpgradeReason('messages')}
           />
         </div>
+      )}
+
+      {/* Trial countdown badge — shows for users in trialing status */}
+      {isSubscribed(user?.id) && (
+        <div className="absolute top-14 right-3 z-30">
+          <TrialCountdownBadge userId={user?.id} />
+        </div>
+      )}
+
+      {/* Cancellation banner — shows when user cancelled but still has access */}
+      {isSubscribed(user?.id) && (
+        <CancellationBanner
+          userId={user?.id}
+          onReactivate={async () => {
+            try {
+              const res = await authFetch('/api/stripe/portal', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+              })
+              const { url } = await res.json()
+              if (url) window.location.href = url
+            } catch { /* swallow */ }
+          }}
+        />
+      )}
+
+      {/* Post-payment success dialog */}
+      {showPaymentSuccess && (
+        <PaymentSuccessDialog
+          onClose={() => setShowPaymentSuccess(false)}
+          trialEndsAt={paymentSuccessInfo?.trialEndsAt}
+          plan={paymentSuccessInfo?.plan}
+        />
+      )}
+
+      {/* Checkout cancelled toast */}
+      {showCheckoutCancelledToast && (
+        <CheckoutCancelledToast onClose={() => setShowCheckoutCancelledToast(false)} />
+      )}
+
+      {/* Billing updated toast (after returning from customer portal) */}
+      {showBillingUpdatedToast && (
+        <InfoToast
+          message="Your subscription has been updated."
+          variant="success"
+          onClose={() => setShowBillingUpdatedToast(false)}
+          durationMs={4000}
+        />
       )}
 
       <ServiceErrorBanner

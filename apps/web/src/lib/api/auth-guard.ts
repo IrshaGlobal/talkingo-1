@@ -1,50 +1,64 @@
+import 'server-only'
+
 /**
  * Server-side auth guard for API routes.
  *
- * Verifies the user has a valid Appwrite session by checking the session cookie.
- * Returns the userId if authenticated, null otherwise.
+ * Verifies the user's Appwrite session using a JWT (JSON Web Token).
+ * The client creates a JWT via account.createJWT() and sends it in the
+ * X-Appwrite-JWT header. This is the official Appwrite pattern for
+ * server-side auth and works reliably across all environments.
  *
  * Usage in API routes:
- *   const userId = await verifyAuth(req)
- *   if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+ *   const auth = await verifyAuth(req)
+ *   if (!auth) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+ *   // auth.userId  → the verified user id
+ *   // auth.jwt     → the JWT (for downstream user-context Appwrite calls)
+ *
+ *   // Backwards-compatible: if you only need the userId
+ *   const userId = await verifyAuthUserId(req)
  */
 
 import { NextRequest } from 'next/server'
 import { Client, Account } from 'node-appwrite'
 
+export interface AuthContext {
+  userId: string
+  jwt: string
+}
+
 /**
- * Verify the user's Appwrite session from request cookies.
- * Returns the user ID if valid, null if not authenticated.
+ * Verify the user's Appwrite session via JWT.
+ * Returns { userId, jwt } if valid, null otherwise.
  */
-export async function verifyAuth(req: NextRequest): Promise<string | null> {
+export async function verifyAuth(req: NextRequest): Promise<AuthContext | null> {
   try {
-    // Appwrite stores session in cookies (a_session_xxx)
-    const cookies = req.headers.get('cookie')
-    if (!cookies) return null
+    const jwt =
+      req.headers.get('x-appwrite-jwt') ||
+      // Backwards-compat: some older clients may still send X-Appwrite-Session
+      req.headers.get('x-appwrite-session')
 
-    // Find the Appwrite session cookie
-    const sessionCookie = cookies
-      .split(';')
-      .map(c => c.trim())
-      .find(c => c.startsWith('a_session_'))
+    if (!jwt) return null
 
-    if (!sessionCookie) return null
-
-    // Create a client with the session
     const client = new Client()
       .setEndpoint(process.env.NEXT_PUBLIC_APPWRITE_ENDPOINT!)
       .setProject(process.env.NEXT_PUBLIC_APPWRITE_PROJECT_ID!)
-
-    // Set the session from cookie
-    const [name, value] = sessionCookie.split('=')
-    client.setSession(value)
+      .setJWT(jwt)
 
     const account = new Account(client)
     const user = await account.get()
-    return user.$id
+    return { userId: user.$id, jwt }
   } catch {
     return null
   }
+}
+
+/**
+ * Convenience: verify auth and return only the userId.
+ * Used by callers that don't need to make further Appwrite calls.
+ */
+export async function verifyAuthUserId(req: NextRequest): Promise<string | null> {
+  const auth = await verifyAuth(req)
+  return auth?.userId ?? null
 }
 
 /**
@@ -79,11 +93,6 @@ export function checkRateLimit(
   return { allowed: true, remaining: maxRequests - entry.count }
 }
 
-/**
- * Lazy cleanup: prune expired entries when the store grows large.
- * Avoids setInterval in serverless (timers don't persist across invocations).
- * Called automatically inside checkRateLimit when store exceeds threshold.
- */
 function pruneExpiredEntries() {
   if (rateLimitStore.size < 100) return
   const now = Date.now()
