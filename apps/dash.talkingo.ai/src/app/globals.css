@@ -1,0 +1,58 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: #0d0f14;
+    --surface-1: #12141c;
+    --surface-2: #181a24;
+    --surface-3: #1f2130;
+    --surface-4: #262940;
+    --text-primary: #f0ecff;
+    --text-secondary: #a8a0c0;
+    --text-tertiary: #6b6384;
+    --border-subtle: rgba(107, 99, 132, 0.12);
+    --border-medium: rgba(107, 99, 132, 0.22);
+    --border-strong: rgba(107, 99, 132, 0.35);
+    --primary: #6c5ce7;
+    --primary-dim: #5a4bd1;
+    --accent: #00d4aa;
+    --error: #ff4d6a;
+    --warning: #ffb347;
+    --success: #00d4aa;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  html {
+    scroll-behavior: smooth;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--text-primary);
+    min-height: 100vh;
+  }
+}
+
+@layer components {
+  .ambient-bg {
+    background:
+      radial-gradient(ellipse 80% 60% at 50% 0%, rgba(108, 92, 231, 0.06), transparent),
+      radial-gradient(ellipse 60% 50% at 100% 80%, rgba(0, 212, 170, 0.04), transparent);
+  }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 4px rgba(108, 92, 231, 0.3); }
+  50% { box-shadow: 0 0 16px rgba(108, 92, 231, 0.5); }
+}
